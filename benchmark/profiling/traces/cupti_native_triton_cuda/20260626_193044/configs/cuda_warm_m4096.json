@@ -1,0 +1,11 @@
+{
+  "cupti_activity_path": "benchmark/profiling/traces/cupti_native_triton_cuda/20260626_193044/activities/cuda_warm_m4096_activity.csv",
+  "cupti_summary_path": "benchmark/profiling/traces/cupti_native_triton_cuda/20260626_193044/activities/cuda_warm_m4096_activity_summary.csv",
+  "iters": 5,
+  "launcher": "cuda_tvm_ffi_extension",
+  "m": 4096,
+  "provider": "cuda",
+  "scenario": "cuda_warm",
+  "triton_use_tvm_ffi": null,
+  "warmup": 10
+}

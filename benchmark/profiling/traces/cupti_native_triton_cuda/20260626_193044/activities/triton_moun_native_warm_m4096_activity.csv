@@ -1,0 +1,1 @@
+record_type,name,activity_kind,cbid,start_ns,end_ns,duration_us,queued_ns,submitted_ns,device_id,context_id,stream_id,correlation_id,grid_id,grid_x,grid_y,grid_z,block_x,block_y,block_z,cluster_x,cluster_y,cluster_z,static_smem,dynamic_smem,shared_memory_executed,registers_per_thread,bytes,copy_kind,src_kind,dst_kind,memset_value,return_value

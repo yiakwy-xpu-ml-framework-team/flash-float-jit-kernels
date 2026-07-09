@@ -1,0 +1,65 @@
+{
+  "cupti_activity_kinds": {
+    "driver": true,
+    "kernel": true,
+    "latency_timestamps": false,
+    "memcpy": true,
+    "memset": true,
+    "runtime": true
+  },
+  "cupti_range_counters": {
+    "enabled": true,
+    "fallback_individual": true,
+    "metrics": [
+      "gpu__time_duration.sum",
+      "dram__bytes_read.sum",
+      "dram__bytes_write.sum",
+      "lts__t_bytes.sum",
+      "sm__ctas_launched.sum",
+      "sm__warps_launched.sum",
+      "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+      "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+      "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
+      "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
+      "smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct",
+      "smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct",
+      "smsp__warp_issue_stalled_barrier_per_warp_active.pct",
+      "smsp__warp_issue_stalled_not_selected_per_warp_active.pct",
+      "smsp__warp_issue_stalled_no_instruction_per_warp_active.pct",
+      "smsp__warp_issue_stalled_wait_per_warp_active.pct"
+    ]
+  },
+  "device": "cuda",
+  "m": [
+    4096
+  ],
+  "poison_output": true,
+  "poison_value": 12345.0,
+  "scenarios": [
+    {
+      "iters": 5,
+      "launcher": "cuda_tvm_ffi_extension",
+      "provider": "cuda",
+      "scenario": "cuda_warm",
+      "triton_use_tvm_ffi": null,
+      "warmup": 10
+    },
+    {
+      "iters": 5,
+      "launcher": "triton_native_kernel_grid_call",
+      "provider": "triton_symm",
+      "scenario": "triton_symm_native_warm",
+      "triton_use_tvm_ffi": false,
+      "warmup": 10
+    },
+    {
+      "iters": 5,
+      "launcher": "triton_native_kernel_grid_call",
+      "provider": "triton_moun",
+      "scenario": "triton_moun_native_warm",
+      "triton_use_tvm_ffi": false,
+      "warmup": 10
+    }
+  ],
+  "seed": 42
+}

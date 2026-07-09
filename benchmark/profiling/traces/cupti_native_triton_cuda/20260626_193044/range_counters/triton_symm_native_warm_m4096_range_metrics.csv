@@ -1,0 +1,17 @@
+range_index,range_name,metric,value,chip_name,num_passes,all_passes_submitted
+0,triton_symm_native_warm_m4096,gpu__time_duration.sum,766944,GH100,12,1
+0,triton_symm_native_warm_m4096,dram__bytes_read.sum,9.91898e+06,GH100,12,1
+0,triton_symm_native_warm_m4096,dram__bytes_write.sum,3.34377e+07,GH100,12,1
+0,triton_symm_native_warm_m4096,lts__t_bytes.sum,5.05388e+08,GH100,12,1
+0,triton_symm_native_warm_m4096,sm__ctas_launched.sum,114,GH100,12,1
+0,triton_symm_native_warm_m4096,sm__warps_launched.sum,912,GH100,12,1
+0,triton_symm_native_warm_m4096,sm__throughput.avg.pct_of_peak_sustained_elapsed,19.036,GH100,12,1
+0,triton_symm_native_warm_m4096,dram__throughput.avg.pct_of_peak_sustained_elapsed,2.77253,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct,13.5116,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct,0.728157,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct,0.227353,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct,8.61014,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_barrier_per_warp_active.pct,17.3014,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_not_selected_per_warp_active.pct,13.3017,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_no_instruction_per_warp_active.pct,1.2376,GH100,12,1
+0,triton_symm_native_warm_m4096,smsp__warp_issue_stalled_wait_per_warp_active.pct,13.1092,GH100,12,1

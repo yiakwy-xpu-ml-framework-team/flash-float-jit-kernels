@@ -1,0 +1,165 @@
+
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>CUPTI Symmetric GEMM Profile</title>
+      <style>
+        body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 32px; color: #202124; background: #f7f8fa; }
+        h1, h2, h3 { margin: 0 0 14px; }
+        h1 { font-size: 28px; }
+        h2 { margin-top: 34px; font-size: 20px; }
+        .subtle { color: #5f6368; margin-bottom: 24px; }
+        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+        .card, .panel { background: white; border: 1px solid #dfe3e8; border-radius: 8px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+        .card-title { font-weight: 700; margin-bottom: 12px; }
+        .metric { display: flex; justify-content: space-between; gap: 18px; margin: 7px 0; }
+        .metric span { color: #5f6368; }
+        .ok { color: #137333; }
+        .bad { color: #b3261e; }
+        .bar, .activity-bar { height: 10px; background: #edf0f3; border-radius: 999px; overflow: hidden; }
+        .bar div { height: 100%; background: #1a73e8; }
+        .activity-row { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(160px, 2fr) 160px; gap: 12px; align-items: center; margin: 8px 0; }
+        .activity-name { overflow-wrap: anywhere; font-size: 13px; }
+        .activity-value { text-align: right; font-variant-numeric: tabular-nums; color: #5f6368; }
+        .activity-bar div { height: 100%; background: #34a853; }
+        .note { color: #5f6368; line-height: 1.45; margin: 0 0 12px; }
+        table { border-collapse: collapse; width: 100%; margin-top: 14px; font-size: 13px; background: white; }
+        th, td { border-bottom: 1px solid #e8eaed; padding: 8px 10px; text-align: left; vertical-align: top; }
+        th { background: #f1f3f4; position: sticky; top: 0; }
+        td { overflow-wrap: anywhere; }
+        .panel { margin-top: 16px; overflow-x: auto; }
+      </style>
+    </head>
+    <body>
+      <h1>CUPTI Symmetric GEMM Profile</h1>
+      <div class="subtle">/home/ubuntu/work/flash-float-jit-kernels/benchmark/profiling/traces/cupti_native_triton_cuda/20260626_193044</div>
+
+      <h2>Latency</h2>
+      <div class="cards">
+            <section class="card">
+              <div class="card-title">cuda_warm</div>
+              <div class="metric"><span>event</span><strong>0.3700 ms</strong></div>
+              <div class="bar"><div style="width:2.00%"></div></div>
+              <div class="metric"><span>wall</span><strong>0.3912 ms</strong></div>
+              <div class="metric"><span>sentinel</span><strong class="ok">0</strong></div>
+            </section>
+            
+            <section class="card">
+              <div class="card-title">triton_symm_native_warm</div>
+              <div class="metric"><span>event</span><strong>0.3468 ms</strong></div>
+              <div class="bar"><div style="width:2.00%"></div></div>
+              <div class="metric"><span>wall</span><strong>0.3569 ms</strong></div>
+              <div class="metric"><span>sentinel</span><strong class="ok">0</strong></div>
+            </section>
+            
+            <section class="card">
+              <div class="card-title">triton_moun_native_warm</div>
+              <div class="metric"><span>event</span><strong>19.8219 ms</strong></div>
+              <div class="bar"><div style="width:100.00%"></div></div>
+              <div class="metric"><span>wall</span><strong>19.8424 ms</strong></div>
+              <div class="metric"><span>sentinel</span><strong class="ok">0</strong></div>
+            </section>
+            </div>
+
+      <h2>Kernel Launch Config</h2>
+      <section class="panel"><table><thead><tr><th>scenario</th><th>kernel</th><th>count</th><th>avg_us</th><th>min_us</th><th>max_us</th><th>grid</th><th>block</th><th>regs/thread</th><th>static_smem</th><th>dynamic_smem</th><th>stream</th></tr></thead><tbody><tr><td>cuda_warm</td><td>hopper_symm_gemm_kernel_entry</td><td>5</td><td>350.730</td><td>349.571</td><td>353.892</td><td>1x132x1</td><td>256x1x1</td><td>154</td><td>33408</td><td>163840</td><td>7</td></tr></tbody></table></section>
+
+      
+      <h2>Roofline</h2>
+      <section class="panel"><p class="note">This roofline uses CUPTI Range Profiler hardware counters for DRAM traffic and GPU time when available.</p><table><thead><tr><th>scenario</th><th>m</th><th>time_us</th><th>time_source</th><th>symm_TFLOP/s</th><th>full_equiv_TFLOP/s</th><th>dram_bytes_MB</th><th>dram_TB/s</th><th>AI_F/B</th><th>l2_bytes_MB</th><th>sm_pct</th><th>dram_pct</th><th>top_stall</th><th>diagnosis</th></tr></thead><tbody><tr><td>cuda_warm</td><td>4096</td><td>640.288</td><td>gpu__time_duration.sum</td><td>107.35</td><td>214.65</td><td>46.98</td><td>0.07</td><td>1462.98</td><td>490.34</td><td>10.2</td><td>3.6</td><td>barrier 22.4%</td><td>SM and DRAM pressure are both relevant; high L2 traffic vs DRAM; top stall: barrier 22.4%</td></tr><tr><td>triton_symm_native_warm</td><td>4096</td><td>766.944</td><td>gpu__time_duration.sum</td><td>89.62</td><td>179.20</td><td>43.36</td><td>0.06</td><td>1585.37</td><td>505.39</td><td>19.0</td><td>2.8</td><td>barrier 17.3%</td><td>SM/compute-side pressure likely; high L2 traffic vs DRAM; top stall: barrier 17.3%</td></tr><tr><td>triton_moun_native_warm</td><td>4096</td><td>21123.000</td><td>gpu__time_duration.sum</td><td>3.25</td><td>6.51</td><td>82.91</td><td>0.00</td><td>829.01</td><td>16536.60</td><td>3.1</td><td>0.2</td><td>long_scoreboard 61.7%</td><td>SM and DRAM pressure are both relevant; high L2 traffic vs DRAM; top stall: long_scoreboard 61.7%</td></tr></tbody></table></section>
+    
+
+      
+      <h2>CUPTI Range Counters</h2>
+      <section class="panel"><table><thead><tr><th>scenario</th><th>range_name</th><th>metric</th><th>value</th><th>chip_name</th><th>num_passes</th><th>all_passes_submitted</th><th>error</th></tr></thead><tbody><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>gpu__time_duration.sum</td><td>640288</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>dram__bytes_read.sum</td><td>1.31446e+07</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>dram__bytes_write.sum</td><td>3.38391e+07</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>lts__t_bytes.sum</td><td>4.90344e+08</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>sm__ctas_launched.sum</td><td>132</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>sm__warps_launched.sum</td><td>1056</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>sm__throughput.avg.pct_of_peak_sustained_elapsed</td><td>10.1556</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>dram__throughput.avg.pct_of_peak_sustained_elapsed</td><td>3.59881</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct</td><td>5.09272</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct</td><td>12.668</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct</td><td>1.81374</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct</td><td>2.44467</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_barrier_per_warp_active.pct</td><td>22.372</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_not_selected_per_warp_active.pct</td><td>8.0931</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_no_instruction_per_warp_active.pct</td><td>3.15203</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>cuda_warm</td><td>cuda_warm_m4096</td><td>smsp__warp_issue_stalled_wait_per_warp_active.pct</td><td>17.8226</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>gpu__time_duration.sum</td><td>766944</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>dram__bytes_read.sum</td><td>9.91898e+06</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>dram__bytes_write.sum</td><td>3.34377e+07</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>lts__t_bytes.sum</td><td>5.05388e+08</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>sm__ctas_launched.sum</td><td>114</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>sm__warps_launched.sum</td><td>912</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>sm__throughput.avg.pct_of_peak_sustained_elapsed</td><td>19.036</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>dram__throughput.avg.pct_of_peak_sustained_elapsed</td><td>2.77253</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct</td><td>13.5116</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct</td><td>0.728157</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct</td><td>0.227353</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct</td><td>8.61014</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_barrier_per_warp_active.pct</td><td>17.3014</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_not_selected_per_warp_active.pct</td><td>13.3017</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_no_instruction_per_warp_active.pct</td><td>1.2376</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_symm_native_warm</td><td>triton_symm_native_warm_m4096</td><td>smsp__warp_issue_stalled_wait_per_warp_active.pct</td><td>13.1092</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>gpu__time_duration.sum</td><td>2.1123e+07</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>dram__bytes_read.sum</td><td>2.7893e+07</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>dram__bytes_write.sum</td><td>5.50208e+07</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>lts__t_bytes.sum</td><td>1.65366e+10</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>sm__ctas_launched.sum</td><td>16</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>sm__warps_launched.sum</td><td>128</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>sm__throughput.avg.pct_of_peak_sustained_elapsed</td><td>3.13013</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>dram__throughput.avg.pct_of_peak_sustained_elapsed</td><td>0.192507</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct</td><td>61.708</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct</td><td>0.287508</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct</td><td>0.0497339</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_math_pipe_throttle_per_warp_active.pct</td><td>0.283499</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_barrier_per_warp_active.pct</td><td>5.49169</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_not_selected_per_warp_active.pct</td><td>0.955636</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_no_instruction_per_warp_active.pct</td><td>0.163384</td><td>GH100</td><td>12</td><td>1</td><td></td></tr><tr><td>triton_moun_native_warm</td><td>triton_moun_native_warm_m4096</td><td>smsp__warp_issue_stalled_wait_per_warp_active.pct</td><td>11.4043</td><td>GH100</td><td>12</td><td>1</td><td></td></tr></tbody></table></section>
+    
+
+      <h2>Correctness Check</h2>
+      <section class="panel"><table><thead><tr><th>reference</th><th>candidate</th><th>matched</th><th>mismatched_elements</th><th>mismatch_pct</th><th>max_abs_diff</th><th>max_rel_diff</th></tr></thead><tbody><tr><td>cuda_warm</td><td>triton_symm_native_warm</td><td>False</td><td>18183</td><td>0.108379</td><td>339.812500</td><td>85937502473733248988064251904.000000</td></tr><tr><td>cuda_warm</td><td>triton_moun_native_warm</td><td>False</td><td>3290</td><td>0.019610</td><td>339.312500</td><td>3181.712402</td></tr></tbody></table></section>
+
+      <h2>CUPTI Activity Summary</h2>
+      
+            <section class="panel">
+              <h3>cuda_warm</h3>
+              
+                <div class="activity-row">
+                  <div class="activity-name">kernel: hopper_symm_gemm_kernel_entry</div>
+                  <div class="activity-bar"><div style="width:100.00%"></div></div>
+                  <div class="activity-value">1753.649 us / 5x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaDeviceSynchronize_v3020</div>
+                  <div class="activity-bar"><div style="width:97.41%"></div></div>
+                  <div class="activity-value">1708.278 us / 3x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaLaunchKernelExC_v11060</div>
+                  <div class="activity-bar"><div style="width:2.63%"></div></div>
+                  <div class="activity-value">46.199 us / 5x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaEventCreateWithFlags_v3020</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">21.532 us / 2x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaEventRecordWithFlags_v11010</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">11.177 us / 2x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaGetDevice_v3020</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">7.508 us / 26x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaFuncSetAttribute_v9000</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">5.547 us / 5x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaStreamIsCapturing_v10000</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">3.385 us / 2x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">driver: cuTensorMapEncodeTiled</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">3.116 us / 20x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaEventQuery_v3020</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">2.082 us / 2x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaEventDestroy_v3020</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">1.783 us / 2x</div>
+                </div>
+                
+                <div class="activity-row">
+                  <div class="activity-name">runtime: cudaEventElapsedTime_v3020</div>
+                  <div class="activity-bar"><div style="width:2.00%"></div></div>
+                  <div class="activity-value">1.462 us / 1x</div>
+                </div>
+                
+              <table><thead><tr><th>record_type</th><th>name</th><th>count</th><th>total_us</th><th>avg_us</th><th>min_us</th><th>max_us</th></tr></thead><tbody><tr><td>kernel</td><td>hopper_symm_gemm_kernel_entry</td><td>5</td><td>1753.649</td><td>350.730</td><td>349.571</td><td>353.892</td></tr><tr><td>runtime</td><td>cudaDeviceSynchronize_v3020</td><td>3</td><td>1708.278</td><td>569.426</td><td>1.012</td><td>1696.430</td></tr><tr><td>runtime</td><td>cudaLaunchKernelExC_v11060</td><td>5</td><td>46.199</td><td>9.240</td><td>2.784</td><td>29.063</td></tr><tr><td>runtime</td><td>cudaEventCreateWithFlags_v3020</td><td>2</td><td>21.532</td><td>10.766</td><td>0.721</td><td>20.811</td></tr><tr><td>runtime</td><td>cudaEventRecordWithFlags_v11010</td><td>2</td><td>11.177</td><td>5.588</td><td>2.083</td><td>9.094</td></tr><tr><td>runtime</td><td>cudaGetDevice_v3020</td><td>26</td><td>7.508</td><td>0.289</td><td>0.090</td><td>2.774</td></tr><tr><td>runtime</td><td>cudaFuncSetAttribute_v9000</td><td>5</td><td>5.547</td><td>1.109</td><td>0.290</td><td>4.297</td></tr><tr><td>runtime</td><td>cudaStreamIsCapturing_v10000</td><td>2</td><td>3.385</td><td>1.693</td><td>0.330</td><td>3.055</td></tr><tr><td>driver</td><td>cuTensorMapEncodeTiled</td><td>20</td><td>3.116</td><td>0.156</td><td>0.070</td><td>1.362</td></tr><tr><td>runtime</td><td>cudaEventQuery_v3020</td><td>2</td><td>2.082</td><td>1.041</td><td>0.290</td><td>1.792</td></tr><tr><td>runtime</td><td>cudaEventDestroy_v3020</td><td>2</td><td>1.783</td><td>0.891</td><td>0.301</td><td>1.482</td></tr><tr><td>runtime</td><td>cudaEventElapsedTime_v3020</td><td>1</td><td>1.462</td><td>1.462</td><td>1.462</td><td>1.462</td></tr></tbody></table>
+            </section>
+            
+<section class="panel"><h3>triton_symm_native_warm</h3><p>No activity summary found.</p></section>
+<section class="panel"><h3>triton_moun_native_warm</h3><p>No activity summary found.</p></section>
+    </body>
+    </html>
+    

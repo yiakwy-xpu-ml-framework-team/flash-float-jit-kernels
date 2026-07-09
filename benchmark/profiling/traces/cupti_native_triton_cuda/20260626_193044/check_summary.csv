@@ -1,0 +1,3 @@
+m,reference,candidate,matched,mismatched_elements,total_elements,mismatch_pct,max_abs_diff,max_rel_diff,rtol,atol
+4096,cuda_warm,triton_symm_native_warm,False,18183,16777216,0.108379,339.812500,85937502473733248988064251904.000000,0.5,0.001
+4096,cuda_warm,triton_moun_native_warm,False,3290,16777216,0.019610,339.312500,3181.712402,0.5,0.001
