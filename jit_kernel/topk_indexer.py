@@ -16,10 +16,14 @@ _CPP_ENTRY = "fast_topk"
 _PY_SYMBOL = "fast_topk"
 
 common_cuda_flags = ["-O2"]
-if USE_TORCH_JIT:
-    major = torch.cuda.get_device_capability()[0]
-    if major > 9:
-        common_cuda_flags += ["-DENABLE_HOPPER=1", "-arch=sm_90"]
+
+if torch.cuda.is_available():
+    major, _minor = torch.cuda.get_device_capability()
+else:
+    major = 0
+
+if USE_TORCH_JIT and major > 9:
+    common_cuda_flags += ["-DENABLE_HOPPER=1", "-arch=sm_90"]
 
 @functools.cache
 def _jit_fast_topk_v3_module():
