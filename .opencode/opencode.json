@@ -1,0 +1,50 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "username": "kernel-dev",
+  "shell": "/bin/bash",
+  "logLevel": "INFO",
+  "share": "manual",
+  "autoupdate": true,
+  "snapshot": true,
+  "instructions": ["AGENTS.md", "RESEARCH_NOTES.md"],
+  "skills": {
+    "paths": [".opencode/skills"]
+  },
+  "agent": {
+    "kernel-dev": {
+      "description": "Specialized agent for GPU kernel development, optimization, and debugging in CUDA, Triton, and Metal. Use for writing, profiling, and iterating on low-level GPU code.",
+      "mode": "subagent",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    }
+  },
+  "permission": {
+    "edit": "allow",
+    "bash": {
+      "git *": "allow",
+      "nvidia-smi": "allow",
+      "python*": "allow",
+      "nvcc*": "allow",
+      "cmake*": "allow",
+      "pip*": "allow",
+      "make*": "allow",
+      "conda*": "allow",
+      "*": "ask"
+    },
+    "webfetch": "allow",
+    "external_directory": {
+      "~/": "allow",
+      "/tmp/*": "allow",
+      "*": "ask"
+    }
+  },
+  "experimental": {
+    "primary_tools": ["edit", "bash"]
+  },
+  "compaction": {
+    "auto": true,
+    "tail_turns": 20
+  }
+}

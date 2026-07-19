@@ -1,0 +1,90 @@
+schemaVersion: "1"
+kind: mixin
+name: flash-kernel-kit
+displayName: Flash Float GPU Kernel Dev
+description: >
+  Pre-installs PyTorch, CUDA toolkit, Triton, and kernel dev tools
+  for flash-float-jit-kernels development. Also installs the
+  kernel agent dependencies (safety harness, SOL calculator, etc).
+
+caps:
+  network:
+    allow:
+      - pypi.org
+      - files.pythonhosted.org
+      - download.pytorch.org
+      - github.com
+      - objects.githubusercontent.com
+
+commands:
+  install:
+    # Python venv tooling
+    - command: "pip install --upgrade pip setuptools wheel"
+      user: "1000"
+      description: Upgrade pip and build tools
+
+    # PyTorch with CUDA
+    - command: "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124"
+      user: "1000"
+      description: Install PyTorch with CUDA 12.4
+
+    # Triton 3.4
+    - command: "pip install triton"
+      user: "1000"
+      description: Install Triton
+
+    # Core deps for flash-float-jit-kernels
+    - command: "pip install numpy packaging setuptools-scm"
+      user: "1000"
+      description: Install core dependencies
+
+    # Benchmarking deps
+    - command: "pip install sglang"
+      user: "1000"
+      description: Install SGLang for TopK benchmarks
+
+  startup:
+    - command: ["bash", "-c", "nvidia-smi 2>/dev/null || echo 'No GPU detected -- running in CPU/dry-run mode'"]
+      description: Show GPU info on start
+    - command: ["bash", "-c", "pip list 2>/dev/null | grep -E 'torch|triton' || echo 'Packages not yet installed'"]
+      description: Verify installed packages
+
+environment:
+  variables:
+    TORCH_CUDA_ARCH_LIST: "9.0"
+
+agentContext: |
+  ## GPU Kernel Development Environment
+
+  You are working in the flash-float-jit-kernels repository.
+
+  **Available tools:**
+  - `python` — Python 3 with PyTorch, Triton, and CUDA support
+  - `nvidia-smi` — Check GPU status
+  - `nvcc` — CUDA compiler (if GPU present)
+
+  **Key commands:**
+  - `python tools/kernel_agent.py --kernel-file <path> --gpu h100 --dry-run`
+    Run safety harness without GPU
+  - `python tools/kernel_agent.py --kernel-file <path> --gpu h100 --max-iterations 40`
+    Full optimization loop
+  - `python tools/sanity_check.py`
+    Verify everything is set up correctly
+
+  **Repository layout:**
+  - `jit_kernel/csrc/` — CUDA kernels (.cu files)
+  - `jit_kernel/triton3_4/` — Triton kernels (.py files)
+  - `tools/` — Agent loop, Modal runner, sanity checks
+  - `benchmark/` — Benchmarking scripts
+
+  **Before claiming a kernel is correct, always run:**
+  1. Smoke test (small input)
+  2. Shape sweep (multiple sizes)
+  3. Stability check (extreme values)
+  4. Determinism check (same output ×3)
+  5. Edge cases (non-power-of-2 dimensions)
+
+  **Never cheat:**
+  - Don't hardcode outputs
+  - Don't skip computation steps
+  - Don't use view/as_strided instead of real data movement
