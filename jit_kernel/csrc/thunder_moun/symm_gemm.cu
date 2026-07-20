@@ -54,6 +54,7 @@ namespace cg = cooperative_groups;
 
 #include "tensor/tuple.h"
 #include "tensor/tensor_view_ref.h"
+#include "profiler.cuh"
 #include "fragment/fragment.h"
 
 // TODO (yiakwy) : move to xpu general interface
@@ -102,7 +103,8 @@ void hopper_symm_gemm_kernel_entry(
     __grid_constant__ const CUtensorMap tma_desc_X,
     __grid_constant__ const CUtensorMap tma_desc_W,
     __grid_constant__ const CUtensorMap tma_desc_O,
-    __grid_constant__ const CUtensorMap tma_desc_O_swizzle)
+    __grid_constant__ const CUtensorMap tma_desc_O_swizzle
+    FFJK_PROFILER_KERNEL_PARAMS)
 {
     // extern __shared__ uint8_t total_smem_space[];
     extern __shared__ __align__(128) uint8_t smem_buffer[];
@@ -112,6 +114,16 @@ void hopper_symm_gemm_kernel_entry(
     uintptr_t aligned_smem = (raw_smem + 127) & ~127;
     uint8_t* smem_buffer = reinterpret_cast<uint8_t*>(aligned_smem);
     */
+
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+    const int profiler_k_tiles_total = CEILDIV(K, K_BLOCK_K);
+    const int profiler_k_tiles_per_slice = CEILDIV(profiler_k_tiles_total, gridDim.x);
+    FFJK_PROFILER_DEFINE_LAYOUT(total_symmetric_tiles, profiler_k_tiles_per_slice);
+    FFJK_PROF_CTA_EVENT_PAYLOAD(
+        ffjk::kProfilerEventKernelEnter,
+        M,
+        N);
+#endif
 
     xpu::HopperWGMMAAccumulator<K_BLOCK_M, K_BLOCK_N, K_BLOCK_K> accumulator_fragment;
     accumulator_fragment.clear();
@@ -135,6 +147,7 @@ void hopper_symm_gemm_kernel_entry(
             num_blocks_m,
             num_blocks_n,
             smem_buffer
+            FFJK_PROFILER_KERNEL_ARGS
         );
     } else
     if (cluster_size_m < 4) {
@@ -151,6 +164,7 @@ void hopper_symm_gemm_kernel_entry(
             num_blocks_m,
             num_blocks_n,
             smem_buffer
+            FFJK_PROFILER_KERNEL_ARGS
         );
     } else
     if (cluster_size_m < 2) {
@@ -167,6 +181,7 @@ void hopper_symm_gemm_kernel_entry(
             num_blocks_m,
             num_blocks_n,
             smem_buffer
+            FFJK_PROFILER_KERNEL_ARGS
         );
     }
 
@@ -180,12 +195,24 @@ extern "C" int symm_gemm_fp8_block_scaled(
     int w_stride_n, int w_stride_k,
     int o_stride_m, int o_stride_n,
     unsigned int split_k,
-    cudaStream_t stream = 0)
+    cudaStream_t stream = 0
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+    , void* profiler_buffer = nullptr,
+    unsigned int profiler_capacity = 0
+#endif
+    )
 {
     using fp8_t = __nv_fp8_e4m3;
     using fp16_t = half;
     using bf16_t = __nv_bfloat16;
     using fp32_t = float;
+
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+    ffjk::CudaProfilerBuffer* profiler = nullptr;
+    if (profiler_buffer != nullptr && profiler_capacity > 0) {
+        profiler = reinterpret_cast<ffjk::CudaProfilerBuffer*>(profiler_buffer);
+    }
+#endif
 
 // TODO(yiakwy) : move to op constructor
 /*
@@ -369,6 +396,27 @@ extern "C" int symm_gemm_fp8_block_scaled(
     dim3 grid(split_k, grid_mn, 1);
     dim3 block(TOTAL_WARP_THREADS, 1, 1);
 
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+    if (profiler != nullptr) {
+        const uint32_t k_tiles_total = CEILDIV(K, K_BLOCK_K);
+        const uint32_t k_tiles_per_slice = CEILDIV(k_tiles_total, split_k);
+        const uint32_t max_tasks_per_cta = CEILDIV(total_symmetric_tiles, grid_mn);
+
+        cudaError_t init_state = ffjk::cuda_profiler_init(
+            profiler_buffer,
+            profiler_capacity,
+            grid.x,
+            grid.y,
+            max_tasks_per_cta,
+            k_tiles_per_slice,
+            stream);
+        if (init_state != cudaSuccess) {
+            printf("[ERROR] cuda profiler init failed: %s\n", cudaGetErrorString(init_state));
+            return -1;
+        }
+    }
+#endif
+
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER // Hopper 900+ GPU with TMA support
     cudaLaunchConfig_t launch_config = {0};
     launch_config.gridDim = grid;
@@ -390,6 +438,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
     cudaError_t state = cudaLaunchKernelEx(&launch_config, kernel,
         (const fp8_t*)X_ptr, (const fp8_t*)W_ptr, (const fp32_t*)scale_X, (fp32_t*)scale_W, (fp16_t*)Out_ptr,
         M, N, K, total_symmetric_tiles, num_blocks_m, num_blocks_n, cluster_size_m, desc_X, desc_W, desc_O, desc_O_swizzle
+        FFJK_PROFILER_LAUNCH_ARG(profiler)
     );
 
     if (state != cudaSuccess) {
@@ -432,7 +481,36 @@ void tvm_jit_symm_gemm_fp8_block_scaled_launch(
     );
 }
 
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+void tvm_jit_symm_gemm_fp8_block_scaled_profiled_launch(
+    TensorView X, TensorView W, TensorView scale_X, TensorView scale_W, TensorView Out,
+    int M, int N, int K,
+    int x_stride_m, int x_stride_k,
+    int w_stride_n, int w_stride_k,
+    int o_stride_m, int o_stride_n,
+    unsigned int split_k,
+    TensorView profiler_buffer,
+    int profiler_capacity)
+{
+    DLDevice device = X.device();
+    cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
+
+    symm_gemm_fp8_block_scaled(
+        X.data_ptr(), W.data_ptr(), scale_X.data_ptr(), scale_W.data_ptr(), Out.data_ptr(),
+        M, N, K,
+        x_stride_m, x_stride_k,
+        w_stride_n, w_stride_k,
+        o_stride_m, o_stride_n,
+        split_k, stream,
+        profiler_buffer.data_ptr(), static_cast<unsigned int>(profiler_capacity)
+    );
+}
+#endif
+
 } // namespace tvm_c_loader
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(symmetric_gemm_fp8_block_scaled, (tvm_c_loader::tvm_jit_symm_gemm_fp8_block_scaled_launch));
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(symmetric_gemm_fp8_block_scaled_profiled, (tvm_c_loader::tvm_jit_symm_gemm_fp8_block_scaled_profiled_launch));
+#endif
 #endif
