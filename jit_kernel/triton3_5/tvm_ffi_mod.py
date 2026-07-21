@@ -1,7 +1,3 @@
-import triton
-
-from packaging import version
-
 import inspect
 import triton.language as tl
 
@@ -31,12 +27,7 @@ def kernel_arg_assignment(name: str) -> str:
     return f"kargs.{name} = {name};\n"
 
 
-# Triton 3.4
 def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
-    # Triton 3.5+
-    if version.parse(triton.__version__) >= version.parse("3.5"):
-        raise Exception("TVM FFI Not Implemented for Triton 3.5+ due to the change of metadata structure, need to update the parsing logic accordingly.")
-    
     if debug:
         print(compiled_kernel.metadata)
         print(compiled_kernel.asm["ptx"].split(".entry", 1)[1].split(")", 1)[0])
@@ -80,6 +71,8 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
     
     launch_args_def.append("CUdeviceptr global_scratch;\n")
     launch_args.append("kargs.global_scratch = 0;\n")
+    launch_args_def.append("CUdeviceptr profile_scratch;\n")
+    launch_args.append("kargs.profile_scratch = 0;\n")
 
     launch_args_def_str = "".join(launch_args_def)
     launch_args_str = "".join(launch_args)
