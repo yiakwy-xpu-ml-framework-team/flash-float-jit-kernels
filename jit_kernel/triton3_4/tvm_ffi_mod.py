@@ -1,20 +1,15 @@
-import inspect
-
 import triton
-import triton.language as tl
+
 from packaging import version
 
+import inspect
+import triton.language as tl
 
 def is_constexpr_param(param):
     ann = param.annotation
     if ann is inspect._empty:
         return False
-    return (
-        ann is tl.constexpr
-        or getattr(ann, "__name__", "") == "constexpr"
-        or "constexpr" in str(ann)
-    )
-
+    return ann is tl.constexpr or getattr(ann, "__name__", "") == "constexpr" or "constexpr" in str(ann)
 
 def cpp_host_type(name: str) -> str:
     if "ptr" in name:
@@ -23,14 +18,12 @@ def cpp_host_type(name: str) -> str:
         return "bool"
     return "int32_t"
 
-
 def kernel_arg_type(name: str) -> str:
     if "ptr" in name:
         return "void*"
     if "use_" in name or "is_" in name:
         return "bool"
     return "int32_t"
-
 
 def kernel_arg_assignment(name: str) -> str:
     if "ptr" in name:
@@ -42,24 +35,22 @@ def kernel_arg_assignment(name: str) -> str:
 def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
     # Triton 3.5+
     if version.parse(triton.__version__) >= version.parse("3.5"):
-        raise Exception(
-            "TVM FFI Not Implemented for Triton 3.5+ due to the change of metadata structure, need to update the parsing logic accordingly."
-        )
-
+        raise Exception("TVM FFI Not Implemented for Triton 3.5+ due to the change of metadata structure, need to update the parsing logic accordingly.")
+    
     if debug:
         print(compiled_kernel.metadata)
         print(compiled_kernel.asm["ptx"].split(".entry", 1)[1].split(")", 1)[0])
 
     arg_names = compiled_kernel.src.fn.arg_names
-    signature = compiled_kernel.src.fn.signature
+    signature = compiled_kernel.src.fn.signature 
 
     # TVM-FFI args list
     cpp_params = []
 
-    # cuLaunchKernel arguemnt definition
+    # cuLaunchKernel arguemnt definition 
     launch_args_def = []
     # cuLaunchKernel argsument assignment
-    launch_args = []
+    launch_args = []  
 
     constants = {}
     constants_set = set()
@@ -77,21 +68,22 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
         # const param should not be added into cpp_params
         if is_constexpr_param(param):
             continue
-
+        
         cpp_params.append(f"{cpp_host_type(name)} {name}")
 
         # const in a compiled kernel should not be added into launch_args_def and launch_args
         if name not in constants_set:
             launch_args_def.append(f"{kernel_arg_type(name)} {name};\n")
             launch_args.append(kernel_arg_assignment(name))
-
-    cpp_params_str = ", ".join(
-        cpp_params + ["int32_t grid_x", "int32_t grid_y", "int32_t grid_z"]
-    )
+            
+    cpp_params_str = ", ".join(cpp_params + ["int32_t grid_x", "int32_t grid_y", "int32_t grid_z"])
+    
+    launch_args_def.append("CUdeviceptr global_scratch;\n")
+    launch_args.append("kargs.global_scratch = 0;\n")
 
     launch_args_def_str = "".join(launch_args_def)
     launch_args_str = "".join(launch_args)
-
+    
     if debug:
         print(f"cpp_params_str : {cpp_params_str}")
         print(f"launch_args_def_str : {launch_args_def_str}")
@@ -99,7 +91,7 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
 
     META = compiled_kernel.metadata
 
-    num_warps = META.num_warps  # compiled_kernel.num_warps
+    num_warps = META.num_warps # compiled_kernel.num_warps
     shared_mem_size = META.shared
 
     WARP_SIZE = META.target.warp_size
@@ -131,7 +123,7 @@ def generate_tvm_ffi_source(compiled_kernel, kernel_name, debug=False):
         }} \
     }} while(0)
 
-
+    
 #define CHECK_CUDA_RUNTIME_ERROR(call) \
     do {{ \
         cudaError_t err = call; \
@@ -153,7 +145,7 @@ TVM_FFI_EMBED_CUBIN(triton_cubin);
 namespace triton_loader {{
 using namespace tvm::ffi;
 
-// NOTE (yiakwy) : TVM's official method does not handle alignment issue, hence I use this method to escape alignment problem.
+// NOTE (yiakwy) : TVM's official method does not handle alignment issue, hence I use this method to escape alignment problem. 
 // We can also consider to modify TVM's official method to support alignment in the future if necessary.
 struct KernelArgs {{
     {launch_args_def_str};
@@ -167,7 +159,7 @@ void {kernel_name}_launcher({cpp_params_str}) {{
 
     {launch_args_str};
 
-    DLDevice device = {arg_names[0]}.device();
+    DLDevice device = {arg_names[0]}.device(); 
 
     int shared_mem_bytes = {shared_mem_size};
     shared_mem_bytes = (shared_mem_bytes + 7) & ~7;
@@ -183,11 +175,11 @@ void {kernel_name}_launcher({cpp_params_str}) {{
     }}
 
     CUfunction kernel = *(reinterpret_cast<CUfunction*>(&launcher));
-
+    
     // NOTE (yiakwy) : use cuda runtime api
-    cudaError_t set_attr_result = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_bytes);
+    cudaError_t set_attr_result = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_bytes); 
     CHECK_CUDA_RUNTIME_ERROR(set_attr_result);
-
+   
     cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 
     tvm::ffi::dim3 grid((unsigned int)grid_x, (unsigned int)grid_y, (unsigned int)grid_z);
@@ -198,12 +190,12 @@ void {kernel_name}_launcher({cpp_params_str}) {{
         CU_LAUNCH_PARAM_BUFFER_POINTER, &kargs,
         CU_LAUNCH_PARAM_BUFFER_SIZE,    &kargs_size,
         CU_LAUNCH_PARAM_END
-    }};
+    }};  
 
     CUresult result = cuLaunchKernel(
-          kernel,
-          grid.x, grid.y, grid.z,
-          block.x, block.y, block.z,
+          kernel, 
+          grid.x, grid.y, grid.z, 
+          block.x, block.y, block.z, 
           (unsigned int)shared_mem_bytes, stream, nullptr, config);
 
     if (result != CUDA_SUCCESS) {{
@@ -215,4 +207,4 @@ void {kernel_name}_launcher({cpp_params_str}) {{
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC({kernel_name}, triton_loader::{kernel_name}_launcher);
 """
-    return source, constants
+    return source, constants 
