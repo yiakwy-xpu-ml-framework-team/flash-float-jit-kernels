@@ -14,6 +14,7 @@ namespace cg = cooperative_groups;
 #include "../arch/cluster/cluster.h"
 
 #include "../arch/warpgroup/reg_allocator.h"
+#include "../profiler.cuh"
 
 // TODO (yiakwy) : refactor flashFloat FragView with Shape and Layout component with support of device side Flash Float datatype
 
@@ -59,6 +60,7 @@ struct HopperPersistentSplitKPipeline {
         int num_blocks_m,
         int num_blocks_n,
         uint8_t* smem_buffer
+        FFJK_PROFILER_KERNEL_PARAMS
     ) {
         using fp8_t = __nv_fp8_e4m3;
         using fp32_t = float;
@@ -138,6 +140,11 @@ struct HopperPersistentSplitKPipeline {
 
         int k_tiles_per_slice = (k_tiles_total + split_k - 1) / split_k;
 
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+        FFJK_PROFILER_DEFINE_LAYOUT(total_symmetric_tiles, k_tiles_per_slice);
+        int ffjk_prof_task_iter = 0;
+#endif
+
         int k_start = split_k_id * k_tiles_per_slice;
         int k_end = min(k_tiles_total, (split_k_id + 1) * k_tiles_per_slice);
 
@@ -148,6 +155,8 @@ struct HopperPersistentSplitKPipeline {
         __syncthreads();
 
         while (local_task_id < total_symmetric_tiles) {
+            const int task_id = local_task_id;
+
             accum.clear();
 
             // if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -214,6 +223,10 @@ struct HopperPersistentSplitKPipeline {
 
             // 1. Ramp Up Fill : to initiate the pipeline, we will fill STAGES-1 stages of data before entering the main loop, and then maintain 1 stage ahead of the main loop to keep the pipeline full.
 
+            FFJK_PROF_BEGIN(
+                ffjk::kProfilerEventPrefetchData,
+                task_id,
+                ffjk::cuda_profiler_pack_u16(k_start, k_end));
 #if  USE_CLUSTER_MULTICAST
             producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load(
                 tid, group_id, block_idx_m, block_idx_n,
@@ -231,6 +244,10 @@ struct HopperPersistentSplitKPipeline {
                 cache_hint_lhs, cache_hint_rhs,
                 write_stage/*src & dst*/);
 #endif
+            FFJK_PROF_END(
+                ffjk::kProfilerEventPrefetchData,
+                task_id,
+                ffjk::cuda_profiler_pack_u16(k_start, k_end));
 
             // if (threadIdx.x == 0 && blockIdx.x == 0) {
             //     printf("[Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
@@ -251,6 +268,10 @@ struct HopperPersistentSplitKPipeline {
             // NOTE (yiakwy) : prefetch all scale without TMA
 
             // TODO (yiakwy) : remap shmem_XS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
+            FFJK_PROF_BEGIN(
+                ffjk::kProfilerEventScaleLoad,
+                task_id,
+                ffjk::cuda_profiler_pack_u16(total_xs_elements, total_ws_elements));
             #pragma unroll 4
             for (int i = tid; i < total_xs_elements; i += threads_per_block) {
                 int s_row = i / k_tiles;
@@ -274,11 +295,20 @@ struct HopperPersistentSplitKPipeline {
                 shmem_WS[s_col] = scale_W[g_row * stride_ws_n + g_col];
             }
             __syncthreads();
+            FFJK_PROF_END(
+                ffjk::kProfilerEventScaleLoad,
+                task_id,
+                ffjk::cuda_profiler_pack_u16(total_xs_elements, total_ws_elements));
 
             int tma_phase = 0;
 
             // 2. main loop
             for (int k_tile = k_start; k_tile < k_end; ++k_tile) {
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+                const int k_iter = k_tile - k_start;
+                const uint32_t k_payload =
+                    ffjk::cuda_profiler_pack_u16(k_tile, k_end);
+#endif
                 uint32_t current_barrier = __cvta_generic_to_shared(&barriers[read_stage]);
 
                 // if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -303,11 +333,15 @@ struct HopperPersistentSplitKPipeline {
                 uint32_t active_smem_w = __cvta_generic_to_shared(&shmem_W[read_stage]);
 
                 // NOTE (yiakwy) : hopper (SM90a) does not support mma_scaled instruction, sx, sw will be ignored in the current implementation, and the scaling will be applied in the epilogue.
+                FFJK_PROF_K_BEGIN(
+                    ffjk::kProfilerEventWgmma,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 HopperWGMMAExecutor::mma_scaled(local_step_accum, active_smem_x, active_smem_w);
 
                 int next_k = k_tile + (STAGES - 1);
                 if (next_k < k_end) {
-
 #if  USE_CLUSTER_MULTICAST
                     producer<STAGES, GROUP_SIZE_M, BM, BN, BK, USE_CLUSTER_MULTICAST, USE_LINEAR_TO_TRIL_LAYOUT>::load_once(
                         tid, group_id,
@@ -325,13 +359,38 @@ struct HopperPersistentSplitKPipeline {
                         cache_hint_lhs, cache_hint_rhs, write_stage, tma_phase
                     );
 #endif
-
                 } // next_k < k_end
 
                 HopperWGMMAExecutor::commit_and_wait();
+                FFJK_PROF_K_END(
+                    ffjk::kProfilerEventWgmma,
+                    k_iter,
+                    task_id,
+                    k_payload);
 
+                FFJK_PROF_K_BEGIN(
+                    ffjk::kProfilerEventScaling,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
+                FFJK_PROF_K_END(
+                    ffjk::kProfilerEventScaling,
+                    k_iter,
+                    task_id,
+                    k_payload);
+
+                FFJK_PROF_K_BEGIN(
+                    ffjk::kProfilerEventAccInPlaceAdd,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 accum.add_(local_step_accum);
+                FFJK_PROF_K_END(
+                    ffjk::kProfilerEventAccInPlaceAdd,
+                    k_iter,
+                    task_id,
+                    k_payload);
                 __syncwarp();
 
                 read_stage = (read_stage + 1) % STAGES;
@@ -343,8 +402,16 @@ struct HopperPersistentSplitKPipeline {
             // 3. Epilogue
             //   - first write data back to share memory for SPLIT-K reduction via NoC
             //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
+            FFJK_PROF_BEGIN(
+                ffjk::kProfilerEventAccumToSmem,
+                task_id,
+                ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
             accum.store(shmem_epilogue);
             __syncthreads();
+            FFJK_PROF_END(
+                ffjk::kProfilerEventAccumToSmem,
+                task_id,
+                ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
 
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
             //     printf("[Epilogue] [Split#%d] [SM#%d] write block <%d, %d> back to shared memory...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
@@ -358,6 +425,12 @@ struct HopperPersistentSplitKPipeline {
             // __syncthreads();
 
             auto cluster = cooperative_groups::this_cluster();
+            if (split_k_id == 0) {
+                FFJK_PROF_BEGIN(
+                    ffjk::kProfilerEventStoreLower,
+                    task_id,
+                    ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
+            }
             cluster.sync();
 
             if (split_k > 1) {
@@ -405,9 +478,21 @@ struct HopperPersistentSplitKPipeline {
                         asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                     }
                     __syncthreads();
+                    FFJK_PROF_END(
+                        ffjk::kProfilerEventStoreLower,
+                        task_id,
+                        ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
 
                     // NOTE (yiakwy) : inplace transpose
+                    FFJK_PROF_BEGIN(
+                        ffjk::kProfilerEventInPlaceTranspose,
+                        task_id,
+                        ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
                     frag_view._transpose();
+                    FFJK_PROF_END(
+                        ffjk::kProfilerEventInPlaceTranspose,
+                        task_id,
+                        ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
 #else
                     // NOTE (yiakwy) : outplace transpose
                     // TODO (yiakwy) : outplace transpose
@@ -416,6 +501,10 @@ struct HopperPersistentSplitKPipeline {
 #endif // USE_INPALCE_TRI_TRANSPOSE
 
                     if (threadIdx.x == 0) {
+                        FFJK_PROF_BEGIN(
+                            ffjk::kProfilerEventStoreMirror,
+                            task_id,
+                            ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
 #if SWIZZLE_64B_STORE
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
 #else
@@ -456,9 +545,24 @@ struct HopperPersistentSplitKPipeline {
                     }
 
                     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    FFJK_PROF_END(
+                        ffjk::kProfilerEventStoreMirror,
+                        task_id,
+                        ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
 
                 } // block_idx_m > block_idx_n
+                else {
+                    FFJK_PROF_END(
+                        ffjk::kProfilerEventStoreLower,
+                        task_id,
+                        ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
+                }
 
+#else
+                FFJK_PROF_END(
+                    ffjk::kProfilerEventStoreLower,
+                    task_id,
+                    ffjk::cuda_profiler_pack_u16(block_idx_m, block_idx_n));
 #endif // USE_LINEAR_TO_TRIL_LAYOUT
 
             } // split_id == 0
@@ -504,6 +608,10 @@ struct HopperPersistentSplitKPipeline {
                 local_task_id += gridDim.y;
             }
             __syncthreads();
+
+#ifdef FFJK_ENABLE_CUDA_PROFILER
+            ++ffjk_prof_task_iter;
+#endif
 
         } // while
     }
