@@ -176,4 +176,9 @@ sbx kit inspect ./sbx-kits/flash-kernel-kit/
 /kernel-opt optimize the topk CUDA kernel
 write a Triton matmul kernel for (4096, 4096) with epilogue fusion
 profile symm_gemm.cu and report SOL gap
+
+# ─── KERNEL AGENT (CPU) ──────────────────────────────────────────
+python3 tools/kernel_agent.py --kernel-file tools/example_kernel.py
+python3 tools/kernel_agent.py --kernel-file tools/example_kernel.py --snapshot
+python3 tools/kernel_agent.py --kernel-file tools/example_kernel.py --snapshot --save report.md
 ```
