@@ -69,7 +69,6 @@ struct HopperPersistentSplitKPipeline {
         // const int lane_id = threadIdx.x % WARP_SIZE;
         // const int warp_id = threadIdx.x / WARP_SIZE;
 
-        /*
         if (tid == 0) {
             {
                 uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_X);
@@ -90,7 +89,6 @@ struct HopperPersistentSplitKPipeline {
             }
         }
         __syncwarp();
-        */
 
 #if USE_CLUSTER_MULTICAST
         uint32_t cluster_rank;
@@ -130,6 +128,9 @@ struct HopperPersistentSplitKPipeline {
         offset += sizeof(OutDtype) * BM * BN;
         auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
         auto* shmem_WS = reinterpret_cast<float*>(smem_buffer + offset + sizeof(fp32_t) * BM * K_TILES_TOTAL);
+
+        offset += sizeof(fp32_t) * (BM * K_TILES_TOTAL + K_TILES_TOTAL);
+        OutDtype* shmem_transpose = reinterpret_cast<OutDtype*>(smem_buffer + offset);
 
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
         __shared__ __align__(128) uint64_t barriers[STAGES];
@@ -383,13 +384,13 @@ struct HopperPersistentSplitKPipeline {
             //   - first write data back to share memory for SPLIT-K reduction via NoC
             //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
 
-            // if (threadIdx.x == 0) {
-            //     nvgpu::arch::tma_store_wait();
-            // }
-            // __syncthreads();
+            if (threadIdx.x == 0) {
+                nvgpu::arch::tma_store_wait();
+            }
+            __syncthreads();
 
             accum.store(shmem_epilogue);
-            // asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
             __syncthreads();
 
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -404,9 +405,10 @@ struct HopperPersistentSplitKPipeline {
             // __syncthreads();
 
             auto cluster = cooperative_groups::this_cluster();
-            cluster.sync();
 
             if (split_k > 1) {
+                cluster.sync();
+
                 if (split_k_id == 0) {
                     if (threadIdx.x == 0) {
                         for (int r = 1; r < split_k; ++r) {
@@ -437,7 +439,7 @@ struct HopperPersistentSplitKPipeline {
                         " [%0, {%2, %3}], [%1];"
                         :
                         : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                        "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                          "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                         : "memory"
                     );
     #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
@@ -455,7 +457,7 @@ struct HopperPersistentSplitKPipeline {
                     __syncthreads();
 
                     // NOTE (yiakwy) : inplace transpose
-                    frag_view._transpose_opt_8x8();
+                    frag_view._transpose_8x8();
 
                     if (threadIdx.x == 0) {
 
@@ -473,7 +475,8 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                            "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                              "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                            : "memory"
                         );
 
                         const uint32_t smem_epilogue_addr_next = smem_epilogue_addr + 128;
@@ -483,7 +486,8 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr_next),
-                                "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
+                              "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
+                            : "memory"
                         );
 #else
                         asm volatile (
@@ -491,25 +495,24 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                            "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                              "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                            : "memory"
                         );
 #endif // SWIZZLE_64B_STORE
-                        // asm volatile("cp.async.bulk.commit_group;");
+                        asm volatile("cp.async.bulk.commit_group;");
+
                     } // inplace copy
 
-                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    // asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
 #else
-                    static_assert(STAGES * sizeof(*shmem_X) >= BM * BN * sizeof(OutDtype),
-                                "X stage storage is too small for the transpose destination.");
-                    OutDtype* shmem_transpose = reinterpret_cast<OutDtype*>(&shmem_X[0]);
 
                     static_assert(SWIZZLE_64B_STORE == 0,
                                   "out-of-place transpose only supports row-major TMA stores.");
-                    frag_view._transpose_outplace_opt_8x8(shmem_transpose);
+                    frag_view.transpose_8x8(shmem_transpose);
 
                     if (threadIdx.x == 0) {
-                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_trans);
+                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
 
                         uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_transpose[0]));
 
@@ -518,20 +521,26 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                            "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                              "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                            : "memory"
                         );
-
-                       // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                        asm volatile("cp.async.bulk.commit_group;");
                     } // outplace copy
 
-                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+                } // outplace copy
+
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
 #endif // USE_INPALCE_TRI_TRANSPOSE
 
                 } // block_idx_m > block_idx_n
 
             } // split_id == 0
+
             cluster.sync();
+            // __syncthreads();
+
 #else
             for (int idx = threadIdx.x; idx < BM * BN; idx += threads_per_block) {
                 int local_m = idx / BN;

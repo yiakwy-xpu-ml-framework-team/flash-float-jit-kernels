@@ -277,7 +277,7 @@ struct FragmentView {
     }
 
     // Experimental row-major-only out-of-place transpose using direct 8x8 tiles.
-    __device__ inline void _transpose_outplace_8x8(T* dst_shared_ptr) const {
+    __device__ inline void transpose_8x8(T* dst_shared_ptr) const {
         constexpr int TILE = 8;
         constexpr int NUM_TILES = BM / TILE;
         constexpr int TOTAL_TILES = NUM_TILES * NUM_TILES;
