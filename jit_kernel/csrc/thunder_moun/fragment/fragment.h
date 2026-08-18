@@ -185,8 +185,6 @@ struct FragmentView {
 
         constexpr int M_STEPS = BM / FRAG_M;
 
-        constexpr int total_diagonal_pairs = (FRAG_M * FRAG_M - FRAG_M) / 2;
-
         constexpr int SWIZZLE_SHIFT = (sizeof(T) == 2) ? 3 : 2;
 
         // NOTE (yiakwy) : process lower left sub fragment
@@ -246,21 +244,25 @@ struct FragmentView {
 
         _warpgroup_sync(wg_id);
 
+        const int warp_rank_in_group = warp_id % 4;
+        const int half_warp_id = lane_id / FRAG_M;
+        const int cyclic_distance = 1 + half_warp_id + 2 * warp_rank_in_group;
+        const int local_col = lane_id % FRAG_M;
+        const int local_row = (local_col + cyclic_distance) % FRAG_M;
+        const bool is_unique_pair =
+            cyclic_distance != FRAG_M / 2 || local_col < FRAG_M / 2;
+
         #pragma unroll
-        for (int task_idx = 0; task_idx < M_STEPS; task_idx++) {
+        for (int tile_pair_base = 0; tile_pair_base < M_STEPS; tile_pair_base += 2) {
+            const int diagonal_tile_idx = tile_pair_base + wg_id;
+            const int diagonal_tile_offset = diagonal_tile_idx * FRAG_M;
 
-            int sub_frag_idx_m_off = task_idx * FRAG_M;
-            int sub_frag_idx_n_off = task_idx * FRAG_M;
+            if (is_unique_pair) {
+                int row_src = diagonal_tile_offset + local_row;
+                int col_src = diagonal_tile_offset + local_col;
 
-            for (int pair_idx = tid; pair_idx < total_diagonal_pairs; pair_idx += threads_per_block) {
-                int thr_row = static_cast<int>((1 + __fsqrt_rn(1 + 8 * pair_idx)) / 2);
-                int thr_col = pair_idx - (thr_row * (thr_row - 1)) / 2;
-
-                int row_src = sub_frag_idx_m_off + thr_row;
-                int col_src = sub_frag_idx_n_off + thr_col;
-
-                int row_dst = sub_frag_idx_n_off + thr_col;
-                int col_dst = sub_frag_idx_m_off + thr_row;
+                int row_dst = diagonal_tile_offset + local_col;
+                int col_dst = diagonal_tile_offset + local_row;
 
                 int src_idx, dst_idx;
 
@@ -282,7 +284,7 @@ struct FragmentView {
                 shared_ptr[dst_idx] = src_val;
             }
 
-        } // end of task_idx
+        } // end of tile_pair_base
         _warpgroup_sync(wg_id);
 
     }
