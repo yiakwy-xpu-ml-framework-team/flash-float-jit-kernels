@@ -61,7 +61,7 @@ def fast_topk_v3(
     """
     assert (
         topk == 2048
-    ), "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
+    ), "fast_topk_v3 is only optimized for deepseek v3.2 model, where topk=2048"
     assert score.dim() == 2
 
     # topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)

@@ -35,7 +35,7 @@ SUPPORTED_DEVICES = ["CUDA", "ROCm"]
 
 operator_namespace = "flash_float-jit-kernel"
 
-ommon_libs = ["c10", "torch", "torch_python"]
+common_libs = ["c10", "torch", "torch_python"]
 
 common_flags = [
     "-DNDEBUG",
