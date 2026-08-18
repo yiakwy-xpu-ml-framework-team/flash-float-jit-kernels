@@ -108,11 +108,11 @@ setup(
     author_email="yiak.wy@gmail.com",
     description="A high-throughput and memory-efficient JIT kernel library for low bit floats of LLM inference",
     version=get_version(),
-    packages=find_packages(where=".", exclude=("benchmark")),
+    packages=find_packages(where=".", exclude=("benchmark*",)),
     install_requires=get_requirements(),
     package_dir={"": "."},
     package_data={
-        "jit_kernel": ["jit_kernel/csrc/**/*.cu", "jit_kernel/csrc/include/*.h", "jit_kernel/csrc/**/*.cpp", "csrc/**/*.h"],
+        "jit_kernel": ["csrc/**/*.cu", "csrc/**/*.h", "csrc/**/*.cpp", "csrc/**/*.cuh"],
     },
     include_package_data=True,
     zip_safe=False,
