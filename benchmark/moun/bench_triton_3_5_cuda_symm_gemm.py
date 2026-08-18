@@ -185,6 +185,16 @@ def calculate_diff(m, dummy):
     print("diff (gluon tma ref): ", diff)
     torch.testing.assert_close(o_gluon_ref, o_torch_ref, rtol=5e-01, atol=1e-03)
 
+    o_gluon_tvm_ffi_ref = symm_gemm_op(x, use_tvm_ffi=True).cpu()
+
+    print("g_gluon_tvm_ffi_ref : ", o_gluon_tvm_ffi_ref)
+
+    diff = o_torch_ref - o_gluon_tvm_ffi_ref
+    print("diff (gluon tma tvm-ffi ref): ", diff)
+    torch.testing.assert_close(
+        o_gluon_tvm_ffi_ref, o_torch_ref, rtol=5e-01, atol=1e-03
+    )
+
     o_symm_fp8_tril = symm_gemm_block_scaled(
         xq.to(torch.float8_e4m3fn), wq.to(torch.float8_e4m3fn), xs_0, xs_1
     ).cpu()
@@ -261,6 +271,24 @@ def calculate_diff(m, dummy):
     gluon_ref_time = (time.time() - start) / iters * 1000
     gluon_ref_device_elapsed = start_event.elapsed_time(end_event) / iters
 
+    # === ThunderMuon Symm Gemm - baseline (Gluon TMA TVM-FFI) ===
+    for _ in range(warmup):
+        _ = symm_gemm_op(x, use_tvm_ffi=True)
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start = time.time()
+    start_event.record()
+    for _ in range(iters):
+        _ = symm_gemm_op(x, use_tvm_ffi=True)
+    end_event.record()
+    torch.cuda.synchronize()
+
+    gluon_tvm_ffi_ref_time = (time.time() - start) / iters * 1000
+    gluon_tvm_ffi_ref_device_elapsed = start_event.elapsed_time(end_event) / iters
+
     # === ThunderMuon Symm Gemm - baseline (CUDA) ===
     for _ in range(warmup):
         _ = symm_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1)
@@ -289,6 +317,9 @@ def calculate_diff(m, dummy):
         f"Gluon TMA kernel             : {gluon_ref_time:.3f} ms, device {gluon_ref_device_elapsed:.3f} ms"
     )
     print(
+        f"Gluon TMA TVM-FFI kernel     : {gluon_tvm_ffi_ref_time:.3f} ms, device {gluon_tvm_ffi_ref_device_elapsed:.3f} ms"
+    )
+    print(
         f"Cuda Muon Symm Gemm          : {symm_gemm_time:.3f} ms, device {symm_gemm_device_elapsed:.3f} ms"
     )
     print(
@@ -311,12 +342,14 @@ configs = list(itertools.product(M, dummy))
             "torch",
             "triton_impl_ref",
             "gluon_muon_symm_gemm",
+            "gluon_muon_symm_gemm_tvm_ffi",
             "cuda_muon_symm_gemm",
         ],
         line_names=[
             "torch",
             "triton_muon_symm_gemm_ref",
             "gluon_muon_symm_gemm",
+            "gluon_muon_symm_gemm_tvm_ffi",
             "cuda_muon_symm_gemm (not optimized)",
         ],
         styles=[
@@ -365,6 +398,8 @@ def benchmark(m: int, dummy: int, provider) -> None:
         fn = lambda: XXT(x)
     elif provider == "gluon_muon_symm_gemm":
         fn = lambda: symm_gemm_op(x)
+    elif provider == "gluon_muon_symm_gemm_tvm_ffi":
+        fn = lambda: symm_gemm_op(x, use_tvm_ffi=True)
     elif provider == "cuda_muon_symm_gemm":
         fn = lambda: symm_gemm_block_scaled(x_fp8, wq_fp8, xs_0, xs_1)
 
