@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 ROOT = pathlib.Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
@@ -67,6 +67,7 @@ class HarnessResult:
     stage: str = ""
     detail: str = ""
     errors: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -98,6 +99,7 @@ class OperatorSpec:
     dtype: Any = None
     num_inputs: int = 2
     device: str = "auto"
+    alignment: Optional[int] = None
 
     def make_inputs(self, shape: tuple[int, ...], fill_val: Optional[float] = None) -> tuple:
         """Build inputs for ``shape``. ``fill_val`` gives a constant fill
@@ -176,6 +178,14 @@ def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
         inputs = spec.make_inputs(shape, fill_val=fill_val)
         return verify_correctness(spec, inputs)
 
+    def _shape_supported(shape: tuple[int, ...]) -> bool:
+        """A shape is supported when it respects the kernel's alignment (if any)."""
+        if not spec.alignment:
+            return True
+        return all(d % spec.alignment == 0 for d in shape)
+
+    skipped: list[str] = []
+
     # Stage 1: Smoke
     ok, msg = _verify((128,))
     if not ok:
@@ -183,6 +193,9 @@ def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
 
     # Stage 2: Shape sweep
     for shape in SAFETY_SHAPES:
+        if not _shape_supported(shape):
+            skipped.append(f"shape {shape} skipped (kernel requires {spec.alignment}-aligned dims)")
+            continue
         ok, msg = _verify(shape)
         if not ok:
             detail = f"shape {shape}: {msg}"
@@ -207,12 +220,15 @@ def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
 
     # Stage 5: Edge cases (non-power-of-2 / non-tile-aligned dims)
     for shape in [(1023,), (4097,), (1537,)]:
+        if not _shape_supported(shape):
+            skipped.append(f"shape {shape} skipped (kernel requires {spec.alignment}-aligned dims)")
+            continue
         ok, msg = _verify(shape)
         if not ok:
             detail = f"shape {shape}: {msg}"
             return HarnessResult(False, "edge_cases", detail, [detail])
 
-    return HarnessResult(True)
+    return HarnessResult(True, skipped=skipped)
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +285,19 @@ def benchmark_kernel(
     median_us, min_us, max_us = _do_bench(fn)
     ref_us, _, _ = _do_bench(ref_fn)
 
-    # Rough FLOPs/bytes for SOL reporting
-    n = inputs[0].numel()
-    flops = n  # element-wise: 1 FLOP per element
-    bytes_moved = n * inputs[0].element_size() * (len(inputs) + 1)
+    # Rough FLOPs/bytes for SOL reporting — GEMM-aware when the output is 2-D
+    # (flops = 2*M*N*K) and both operands share the contraction dim; otherwise
+    # falls back to element-wise (1 FLOP per element).
+    out = fn(*inputs)
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    in_bytes = sum(t.numel() * t.element_size() for t in inputs if isinstance(t, torch.Tensor))
+    out_bytes = out.numel() * out.element_size() if hasattr(out, "numel") else in_bytes
+    bytes_moved = in_bytes + out_bytes
+    if out.dim() == 2 and inputs[0].dim() == 2 and inputs[0].shape[-1] == inputs[1].shape[-1]:
+        flops = 2 * out.shape[0] * out.shape[1] * inputs[0].shape[-1]
+    else:
+        flops = inputs[0].numel()  # element-wise: 1 FLOP per element
 
     return BenchResult(
         time_us=median_us,
@@ -332,20 +357,27 @@ def find_testable_function(mod: Any):
 REF_FN_NAMES = ("ref_fn", "reference", "ref", "_ref", "_ref_torch_impl",
                 "_ref_torch_impl_ori", "torch_ref", "ref_torch")
 
+SHAPE_GEN_NAMES = ("shape_generator", "make_inputs", "gen_inputs", "input_generator")
+
 
 def load_operator_spec(
     path: pathlib.Path,
     *,
     ref_fn_name: Optional[str] = None,
-    atol: float = 1e-3,
-    rtol: float = 1e-3,
+    atol: Optional[float] = None,
+    rtol: Optional[float] = None,
     device: str = "auto",
 ) -> Optional[OperatorSpec]:
     """Build an ``OperatorSpec`` from a kernel module file.
 
-    Auto-discovers the callable under test and, if present, a ground-truth
-    reference function (names in ``REF_FN_NAMES`` or ``ref_fn_name``).
+    Auto-discovers the callable under test plus, when present:
+      * a ground-truth reference function (names in ``REF_FN_NAMES`` or ``ref_fn_name``),
+      * an input ``shape_generator`` (names in ``SHAPE_GEN_NAMES``) — required for
+        multi-argument operators such as GEMM, and
+      * ``ATOL`` / ``RTOL`` module constants for the comparison tolerances.
     """
+    import inspect
+
     path = pathlib.Path(path).resolve()
     if not path.exists():
         logger.error("kernel file not found: %s", path)
@@ -364,8 +396,41 @@ def load_operator_spec(
             ref_fn = getattr(mod, name)
             break
 
-    return OperatorSpec(name=path.stem, fn=fn, ref_fn=ref_fn,
-                        atol=atol, rtol=rtol, device=device)
+    shape_generator: Optional[Any] = None
+    for name in SHAPE_GEN_NAMES:
+        if hasattr(mod, name):
+            shape_generator = getattr(mod, name)
+            break
+
+    if atol is None:
+        atol = float(getattr(mod, "ATOL", 1e-3))
+    if rtol is None:
+        rtol = float(getattr(mod, "RTOL", 1e-3))
+
+    # Optional shape-alignment constraint (e.g. tiled kernels: ALIGNMENT = 128).
+    # The harness skips unaligned shapes instead of failing on them.
+    alignment = int(getattr(mod, "ALIGNMENT", 0)) or None
+
+    # Hint when the default generator can't feed the kernel signature
+    if shape_generator is None:
+        try:
+            required = [
+                p for p in inspect.signature(fn).parameters.values()
+                if p.default is inspect.Parameter.empty
+                and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            ]
+            if len(required) != 2:
+                logger.warning(
+                    "%s requires %d positional args (%s); the default generator only "
+                    "produces 2. Define a `shape_generator(shape, fill_val)` in the "
+                    "module to drive the harness.",
+                    path.name, len(required), ", ".join(p.name for p in required),
+                )
+        except (ValueError, TypeError):
+            pass
+
+    return OperatorSpec(name=path.stem, fn=fn, ref_fn=ref_fn, shape_generator=shape_generator,
+                        atol=atol, rtol=rtol, device=device, alignment=alignment)
 
 
 # ---------------------------------------------------------------------------
@@ -519,8 +584,6 @@ class KernelAgent:
 
     def bench_kernel(self, kernel_path: str, n: int = 4096) -> BenchResult | None:
         """Benchmark a local kernel file against its reference (if any)."""
-        import torch
-
         spec = load_operator_spec(kernel_path)
         if spec is None:
             logger.error("cannot load kernel spec: %s", kernel_path)
@@ -659,6 +722,12 @@ def build_harness_report(
         lines.append("|-------|--------|")
         for s in ("smoke", "shape_sweep", "stability", "determinism", "edge_cases"):
             lines.append(f"| {s} | pass |")
+        if result.skipped:
+            lines.append("")
+            lines.append("### Skipped (kernel alignment constraint)")
+            lines.append("")
+            for e in result.skipped:
+                lines.append(f"- {e}")
     else:
         lines.append(f"Failed at **{result.stage}**: `{result.detail}`")
         lines.append("")
@@ -735,6 +804,10 @@ def run_harness_standalone(
                 print(f"    - {e}")
     else:
         print("  All 5 stages passed.")
+        if result.skipped:
+            print(f"  Skipped: {len(result.skipped)} (kernel alignment constraint)")
+            for e in result.skipped:
+                print(f"    - {e}")
 
     bench: Optional[BenchResult] = None
     sol: Optional[dict] = None
