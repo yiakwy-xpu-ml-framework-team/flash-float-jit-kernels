@@ -1,7 +1,7 @@
 # Harness Report — `thunder_moun`
 
 - **File**: `jit_kernel/thunder_moun.py`
-- **Timestamp**: 2026-08-19T08:39:49
+- **Timestamp**: 2026-08-19T14:50:36
 - **Correctness**: PASS (stage: n/a)
 - **Reference compared**: yes
 
@@ -26,17 +26,17 @@
 
 ## Performance (triton.testing.do_bench, quantiles [0.5, 0.2, 0.8])
 
-- **Input size**: N = 1024
-- **Time (median)**: 24.4 us (min 24.1 / max 25.0)
-- **Reference time**: 15.4 us (speedup 0.63x)
-- **SOL time**: 2.2 us
-- **SOL gap**: 11.22x
-- **Classification**: compute-bound (compute 2.2 us / mem 1.3 us)
+- **Input size**: N = 4096
+- **Time (median)**: 143.3 us (min 142.2 / max 144.2)
+- **Reference time**: 216.0 us (speedup 1.51x)
+- **SOL time**: 138.9 us
+- **SOL gap**: 1.03x
+- **Classification**: compute-bound (compute 138.9 us / mem 20.2 us)
 
 | Metric | Value |
 |--------|-------|
-| median (us) | 24.4 |
-| min (us) | 24.1 |
-| max (us) | 25.0 |
-| reference (us) | 15.4 |
-| speedup vs ref | 0.63x |
+| median (us) | 143.3 |
+| min (us) | 142.2 |
+| max (us) | 144.2 |
+| reference (us) | 216.0 |
+| speedup vs ref | 1.51x |
