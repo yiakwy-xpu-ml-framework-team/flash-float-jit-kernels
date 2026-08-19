@@ -16,6 +16,12 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 #endif
 
+#ifndef WARPS_PER_CTA
+
+#define WARPS_PER_CTA 8
+
+#endif
+
 #ifndef SWIZZLE_64B_STORE
 
 #define SWIZZLE_64B_STORE 0
@@ -247,22 +253,23 @@ struct FragmentView {
         const int warp_rank_in_group = warp_id % 4;
         const int half_warp_id = lane_id / FRAG_M;
         const int cyclic_distance = 1 + half_warp_id + 2 * warp_rank_in_group;
-        const int local_col = lane_id % FRAG_M;
-        const int local_row = (local_col + cyclic_distance) % FRAG_M;
+        const int thr_col = lane_id % FRAG_M;
+        const int thr_row = (thr_col + cyclic_distance) % FRAG_M;
         const bool is_unique_pair =
-            cyclic_distance != FRAG_M / 2 || local_col < FRAG_M / 2;
+            cyclic_distance != FRAG_M / 2 || thr_col < FRAG_M / 2;
 
         #pragma unroll
-        for (int tile_pair_base = 0; tile_pair_base < M_STEPS; tile_pair_base += 2) {
-            const int diagonal_tile_idx = tile_pair_base + wg_id;
-            const int diagonal_tile_offset = diagonal_tile_idx * FRAG_M;
+        for (int task_idx = 0; task_idx < M_STEPS; task_idx+=2) {
+            int tile_idx = task_idx + wg_id;
+            int sub_frag_idx_m_off = tile_idx * FRAG_M;
+            int sub_frag_idx_n_off = tile_idx * FRAG_M;
 
             if (is_unique_pair) {
-                int row_src = diagonal_tile_offset + local_row;
-                int col_src = diagonal_tile_offset + local_col;
+                int row_src = sub_frag_idx_m_off + thr_row;
+                int col_src = sub_frag_idx_n_off + thr_col;
 
-                int row_dst = diagonal_tile_offset + local_col;
-                int col_dst = diagonal_tile_offset + local_row;
+                int row_dst = sub_frag_idx_n_off + thr_col;
+                int col_dst = sub_frag_idx_m_off + thr_row;
 
                 int src_idx, dst_idx;
 
@@ -312,20 +319,25 @@ struct FragmentView {
 
     // Experimental row-major-only transpose using a direct 8x8 tiling.
     __device__ inline void _transpose_8x8() {
-        constexpr int TILE = 8;
-        constexpr int NUM_TILES = BM / TILE;
-        constexpr int TOTAL_OFFDIAGONAL_TILE_PAIRS =
-            NUM_TILES * (NUM_TILES - 1) / 2;
-        constexpr int WARPS_PER_CTA = 8;
-
-        static_assert(sizeof(T) == 2, "optimized transpose only supports 16-bit elements.");
         static_assert(BM == BN, "inplace transpose can be only applied to square fragment.");
-        static_assert(BM % TILE == 0, "optimized transpose requires BM to be divisible by 8.");
+        static_assert(sizeof(T) == 2, "optimized transpose only supports 16-bit elements.");
+
+        const int tid = threadIdx.x;
+        constexpr int threads_per_block = CONSUMER_THREADS;
 
         const int lane_id = threadIdx.x % WARP_SIZE;
         const int warp_id = threadIdx.x / WARP_SIZE;
 
         const int wg_id = warp_id / 4;
+
+        constexpr int FRAG_M = 8;
+        constexpr int TOTAL_ELEMENTS = BM * BN;
+
+        constexpr int M_STEPS = BM / FRAG_M;
+
+        constexpr int total_off_diagonal_pairs = (M_STEPS * M_STEPS - M_STEPS) / 2;
+
+        constexpr int SWIZZLE_SHIFT = (sizeof(T) == 2) ? 3 : 2;
 
         const int lane_row = lane_id / 4;
         const int lane_pair = lane_id % 4;
@@ -333,28 +345,25 @@ struct FragmentView {
 
         // Each of the eight warps handles one off-diagonal 8x8 tile pair.
         #pragma unroll
-        for (int pair_base = 0;
-             pair_base < TOTAL_OFFDIAGONAL_TILE_PAIRS;
-             pair_base += WARPS_PER_CTA) {
-            const int tile_pair_idx = pair_base + warp_id;
+        for (int pair_idx = 0; pair_idx < total_off_diagonal_pairs; pair_idx += WARPS_PER_CTA) {
+            const int tile_pair_idx = pair_idx + warp_id;
 
-            if (tile_pair_idx < TOTAL_OFFDIAGONAL_TILE_PAIRS) {
+            if (tile_pair_idx < total_off_diagonal_pairs) {
                 int tile_m = 1;
 
                 #pragma unroll
-                for (int candidate_m = 2; candidate_m < NUM_TILES; ++candidate_m) {
+                for (int candidate_m = 2; candidate_m < M_STEPS; ++candidate_m) {
                     if (tile_pair_idx >= candidate_m * (candidate_m - 1) / 2) {
                         tile_m = candidate_m;
                     }
                 }
 
-                const int tile_n =
-                    tile_pair_idx - tile_m * (tile_m - 1) / 2;
+                const int tile_n = tile_pair_idx - tile_m * (tile_m - 1) / 2;
 
-                const int src_row_base = tile_m * TILE;
-                const int src_col_base = tile_n * TILE;
-                const int dst_row_base = tile_n * TILE;
-                const int dst_col_base = tile_m * TILE;
+                const int src_row_base = tile_m * FRAG_M;
+                const int src_col_base = tile_n * FRAG_M;
+                const int dst_row_base = tile_n * FRAG_M;
+                const int dst_col_base = tile_m * FRAG_M;
 
                 const int src_idx =
                     (src_row_base + lane_row) * BM + src_col_base + local_col;
@@ -376,12 +385,12 @@ struct FragmentView {
 
         // The same eight warps transpose the sixteen diagonal 8x8 tiles in two rounds.
         #pragma unroll
-        for (int tile_base = 0; tile_base < NUM_TILES; tile_base += WARPS_PER_CTA) {
+        for (int tile_base = 0; tile_base < M_STEPS; tile_base += WARPS_PER_CTA) {
             const int tile_idx = tile_base + warp_id;
 
-            if (tile_idx < NUM_TILES) {
-                const int row_base = tile_idx * TILE;
-                const int col_base = tile_idx * TILE;
+            if (tile_idx < M_STEPS) {
+                const int row_base = tile_idx * FRAG_M;
+                const int col_base = tile_idx * FRAG_M;
                 const int packed_idx =
                     (row_base + lane_row) * BM + col_base + local_col;
 
@@ -400,45 +409,41 @@ struct FragmentView {
 
     // Experimental row-major-only out-of-place transpose using direct 8x8 tiles.
     __device__ inline void transpose_8x8(T* dst_shared_ptr) const {
-        constexpr int TILE = 8;
-        constexpr int NUM_TILES = BM / TILE;
-        constexpr int TOTAL_TILES = NUM_TILES * NUM_TILES;
-        constexpr int WARPS_PER_CTA = 8;
+        constexpr int FRAG_M = 8;
+        constexpr int M_STEPS = BM / FRAG_M;
+        constexpr int total_sub_fragments = M_STEPS * M_STEPS;
 
         static_assert(sizeof(T) == 2, "optimized transpose only supports 16-bit elements.");
         static_assert(BM == BN, "out-of-place transpose can be only applied to square fragment.");
-        static_assert(BM % TILE == 0, "optimized transpose requires BM to be divisible by 8.");
+        static_assert(BM % FRAG_M == 0, "optimized transpose requires BM to be divisible by 8.");
 
         const int lane_id = threadIdx.x % WARP_SIZE;
         const int warp_id = threadIdx.x / WARP_SIZE;
 
         const int wg_id = warp_id / 4;
 
-        const int lane_row = lane_id / 4;
-        const int lane_pair = lane_id % 4;
-        const int local_col = 2 * lane_pair;
+        const int thr_row = lane_id / 4;
+        const int thr_col = 2 * (lane_id % 4);
 
         // Source and destination do not overlap. Each warp therefore handles one
         // complete 8x8 tile rather than exchanging an off-diagonal tile pair.
         #pragma unroll
-        for (int tile_base = 0;
-             tile_base < TOTAL_TILES;
-             tile_base += WARPS_PER_CTA) {
-            const int tile_idx = tile_base + warp_id;
+        for (int task_idx = 0;
+             task_idx < total_sub_fragments;
+             task_idx += WARPS_PER_CTA) {
+            const int sub_frag_idx = task_idx + warp_id;
 
-            if (tile_idx < TOTAL_TILES) {
-                const int src_tile_row = tile_idx / NUM_TILES;
-                const int src_tile_col = tile_idx % NUM_TILES;
+            if (sub_frag_idx < total_sub_fragments) {
+                const int sub_frag_idx_m = sub_frag_idx / M_STEPS;
+                const int sub_frag_idx_n = sub_frag_idx % M_STEPS;
 
-                const int src_row_base = src_tile_row * TILE;
-                const int src_col_base = src_tile_col * TILE;
-                const int dst_row_base = src_tile_col * TILE;
-                const int dst_col_base = src_tile_row * TILE;
+                const int sub_frag_idx_m_off = sub_frag_idx_m * FRAG_M;
+                const int sub_frag_idx_n_off = sub_frag_idx_n * FRAG_M;
 
                 const int src_idx =
-                    (src_row_base + lane_row) * BM + src_col_base + local_col;
+                    (sub_frag_idx_m_off + thr_row) * BM + sub_frag_idx_n_off + thr_col;
                 const int dst_idx =
-                    (dst_row_base + lane_row) * BM + dst_col_base + local_col;
+                    (sub_frag_idx_n_off + thr_row) * BM + sub_frag_idx_m_off + thr_col;
 
                 const uint32_t old_value =
                     *reinterpret_cast<const uint32_t*>(shared_ptr + src_idx);
