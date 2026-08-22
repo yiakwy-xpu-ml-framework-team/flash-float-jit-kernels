@@ -1,5 +1,20 @@
 # Research Notes: flash-float-jit-kernels
 
+## thunder_moun GEMM 优化方向偏好（人工指定的优先级）
+
+仅在以下三个方向上尝试优化，按优先级排序：
+1. **on-chip split-k all-reduce**：降低跨 block 归约（k-dim 归并）的开销。
+2. **inplace transpose**：优化 inplace transpose，并完善 output transpose 路径。
+3. **Fragment shape**：尝试不同的 Fragment shape 组合，用足更大算力（MFU）。
+
+硬约束：
+- **不要**把原来定义在 `fragment/` 里的东西挪出去。
+- **不要**重写与现有功能一致的实现——没有可量化加速的改写直接省略。
+- 每次 edit 都必须带有明确的性能动机（approx SOL / bottleneck 分析），并保持
+  `jit_kernel/thunder_moun.py` 与 `csrc/` 的现有接口不变。
+
+
+
 ## Paper References
 
 ### AutoKernel (2026) [1]

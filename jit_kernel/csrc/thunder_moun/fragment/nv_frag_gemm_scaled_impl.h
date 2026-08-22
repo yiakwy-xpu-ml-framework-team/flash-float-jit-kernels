@@ -147,6 +147,94 @@ struct HopperWGMMAAccumulator {
         __syncwarp();
     }
 
+    // Packed row-major store.
+    //
+    // A WGMMA thread's registers come in float2 pairs {regs[4i+0], regs[4i+1]}
+    // and {regs[4i+2], regs[4i+3]} that map to two *adjacent columns* of the
+    // same row (see getTargetWgmmaSmemOffset; (col, col+1) at (row) and at
+    // (row+8) respectively), so each pair converts to one half2 and lands in
+    // smem with a single 32-bit STS. This halves the shared-store instruction
+    // count on the epilogue critical path vs the scalar store() above.
+    template<typename Dtype>
+    __device__ inline void store_packed(Dtype* smem) {
+        static_assert(sizeof(Dtype) == 2, "packed store expects a 2-byte dtype");
+
+        const int warp_id = threadIdx.x / WARP_SIZE;
+
+        const int wg_id = warp_id / WARP_GROUP;
+        const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
+
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
+
+        const int M_STEPS = BM / FRAG_M / wgs;
+
+        #pragma unroll
+        for (int m_step = 0; m_step < M_STEPS; ++m_step) {
+            #pragma unroll
+            for (int i = 0; i < kRegistersPerThread; i += 4) {
+                int row, col;
+                getTargetWgmmaSmemOffset(wg_id, wg_lane_id, i, m_step, M_STEPS, &row, &col);
+
+                if constexpr (!std::is_same_v<Dtype, AccDtype>) {
+                    *reinterpret_cast<__half2 *>(&smem[row * BN + col]) =
+                        __floats2half2_rn(regs[m_step][i + 0], regs[m_step][i + 1]);
+                    *reinterpret_cast<__half2 *>(&smem[(row + 8) * BN + col]) =
+                        __floats2half2_rn(regs[m_step][i + 2], regs[m_step][i + 3]);
+                } else {
+                    *reinterpret_cast<float2 *>(&smem[row * BN + col]) =
+                        make_float2(regs[m_step][i + 0], regs[m_step][i + 1]);
+                    *reinterpret_cast<float2 *>(&smem[(row + 8) * BN + col]) =
+                        make_float2(regs[m_step][i + 2], regs[m_step][i + 3]);
+                }
+            }
+        }
+        __syncwarp();
+    }
+
+    // Transposed (a.k.a. "output transpose path") register-direct scatter:
+    //     smem_T[col * BM + row] = acc(row, col)
+    // i.e. the fragment is written *transposed* into a plain row-major smem
+    // tile. This is exactly the smem layout consumed by the out-of-place
+    // transpose TMA store (desc_O_trans, swapped tile coordinates), so the
+    // epilogue no longer needs the shared-memory read-modify-write
+    // FragmentView::_transpose (nor the tma_store_wait that guards it) -- the
+    // normal + transposed TMA stores can be issued back to back in a single
+    // bulk group.
+    //
+    // Columns of the threaded fragment map to rows of smem_T; a warp's lanes
+    // spread over (row/2) % 32 banks, so the scatter is ~4-way word-conflicted
+    // -- still far cheaper than a smem->smem transpose round trip.
+    template<typename Dtype>
+    __device__ inline void store_transposed(Dtype* smem_T) {
+        static_assert(sizeof(Dtype) == 2, "transposed store expects a 2-byte dtype");
+        static_assert(BM == BN, "transposed store expects a square tile");
+
+        const int warp_id = threadIdx.x / WARP_SIZE;
+
+        const int wg_id = warp_id / WARP_GROUP;
+        const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
+
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
+
+        const int M_STEPS = BM / FRAG_M / wgs;
+
+        #pragma unroll
+        for (int m_step = 0; m_step < M_STEPS; ++m_step) {
+            #pragma unroll
+            for (int i = 0; i < kRegistersPerThread; ++i) {
+                int row, col;
+                getTargetWgmmaSmemOffset(wg_id, wg_lane_id, i, m_step, M_STEPS, &row, &col);
+
+                if constexpr (!std::is_same_v<Dtype, AccDtype>) {
+                    smem_T[col * BM + row] = static_cast<Dtype>(regs[m_step][i]);
+                } else {
+                    smem_T[col * BM + row] = regs[m_step][i];
+                }
+            }
+        }
+        __syncwarp();
+    }
+
     __device__ inline void mul_(float scale) {
         constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
 

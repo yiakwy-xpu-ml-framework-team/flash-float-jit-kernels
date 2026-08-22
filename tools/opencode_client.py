@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlencode
 
 import urllib.request
@@ -169,6 +169,24 @@ class OpenCodeClient:
 
     def share_session(self, session_id: str) -> dict:
         return _post(self.base, f"/session/{session_id}/share")
+
+    # -- permissions (human-in-the-loop approval) -------------------------
+
+    def list_permissions(self) -> list[dict]:
+        """List ALL pending permission requests (across sessions).
+
+        Each item: ``{id, sessionID, permission, patterns, metadata, always, tool}``.
+        Filter by ``sessionID`` for the session you drive.
+        """
+        return _get(self.base, "/permission") or []
+
+    def reply_permission(self, request_id: str, reply: str) -> Any:
+        """Respond to a pending permission request.
+
+        ``reply`` is one of ``"once"`` (approve this call), ``"always"``
+        (approve this call and auto-approve identical ones) or ``"reject"``.
+        """
+        return _post(self.base, f"/permission/{request_id}/reply", body={"reply": reply})
 
     def revert_message(
         self, session_id: str, message_id: str, part_id: Optional[str] = None
@@ -362,13 +380,21 @@ class OpenCodeClient:
         *,
         timeout_ms: int = 300_000,
         poll_interval: float = 1.5,
+        poll_hook: Optional[Callable[[], None]] = None,
     ) -> str:
-        """Poll until the assistant finishes replying. Returns the text."""
+        """Poll until the assistant finishes replying. Returns the text.
+
+        ``poll_hook`` (if given) runs before every poll — e.g. the
+        orchestrator uses it to service pending permission requests while
+        the agent is working.
+        """
         start = time.monotonic()
         deadline = start + timeout_ms / 1000.0
         last_len = 0
 
         while time.monotonic() < deadline:
+            if poll_hook is not None:
+                poll_hook()
             messages = self.list_messages(session_id)
             assistant = self._find_reply(messages, user_message_id)
             if assistant:
@@ -393,6 +419,7 @@ class OpenCodeClient:
         *,
         agent: Optional[str] = None,
         timeout_ms: int = 300_000,
+        poll_hook: Optional[Callable[[], None]] = None,
     ) -> str:
         """Send prompt asynchronously, then wait for reply. Returns text."""
         before = len(self.list_messages(session_id))
@@ -407,4 +434,6 @@ class OpenCodeClient:
             if info.get("role") == "user":
                 user_msg_id = info.get("id")
                 break
-        return self.wait_for_reply(session_id, user_msg_id, timeout_ms=timeout_ms)
+        return self.wait_for_reply(
+            session_id, user_msg_id, timeout_ms=timeout_ms, poll_hook=poll_hook
+        )

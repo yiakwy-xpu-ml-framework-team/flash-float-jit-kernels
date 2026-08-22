@@ -17,8 +17,8 @@ Architecture:
 Usage:
     python tools/kernel_agent.py serve --port 8096
     python tools/kernel_agent.py harness --kernel jit_kernel/thunder_moun.py
-    python tools/kernel_agent.py verify --kernel tools/example_kernel.py
-    python tools/kernel_agent.py benchmark --kernel tools/example_kernel.py
+    python tools/kernel_agent.py verify --kernel jit_kernel/thunder_moun.py
+    python tools/kernel_agent.py benchmark --kernel jit_kernel/thunder_moun.py
 """
 
 from __future__ import annotations
@@ -452,6 +452,7 @@ class KernelAgent:
         port: int = DEFAULT_PORT,
         host: str = DEFAULT_HOST,
         project_dir: Optional[str] = None,
+        interactive_permissions: bool = False,
     ) -> None:
         self.port = port
         self.host = host
@@ -461,6 +462,8 @@ class KernelAgent:
         self._server_proc: Optional[subprocess.Popen] = None
         self._session_id: Optional[str] = None
         self._history: list[dict] = []
+        self.interactive_permissions = interactive_permissions
+        self._answered_permissions: set[str] = set()
 
     # -- server lifecycle ----------------------------------------------------
 
@@ -530,13 +533,74 @@ class KernelAgent:
     # -- prompting -----------------------------------------------------------
 
     def prompt(self, text: str, *, agent: Optional[str] = None, timeout_ms: int = 300_000) -> str:
-        """Send a prompt and wait for the reply. Returns the text."""
+        """Send a prompt and wait for the reply. Returns the text.
+
+        When ``interactive_permissions`` is on, pending permission requests
+        (opencode ``action.action=ask``) are serviced from the keyboard
+        while waiting, instead of stalling the loop forever.
+        """
         logger.info("prompting session %s (%d chars)", self.session_id, len(text))
+        hook = (
+            self._service_permission_asks
+            if self.interactive_permissions and sys.stdin.isatty()
+            else None
+        )
         reply = self.client.send_and_wait(
-            self.session_id, text, agent=agent, timeout_ms=timeout_ms
+            self.session_id, text, agent=agent, timeout_ms=timeout_ms, poll_hook=hook
         )
         self._history.append({"role": "user", "text": text, "reply_len": len(reply)})
         return reply
+
+    # -- interactive permission approval ----------------------------------
+
+    def _service_permission_asks(self) -> None:
+        """Ask the operator (keyboard) to approve/reject pending permissions."""
+        try:
+            pending = [
+                p for p in self.client.list_permissions()
+                if p.get("sessionID") == self._session_id
+            ]
+        except Exception:
+            return  # endpoint missing/erroring — keep polling as before
+        for req in pending:
+            pid = req.get("id")
+            if not pid or pid in self._answered_permissions:
+                continue
+            self._answered_permissions.add(pid)
+            reply = self._keyboard_approve(req)
+            try:
+                self.client.reply_permission(pid, reply)
+                logger.info("permission %s (%s): %s", pid, req.get("permission"), reply)
+            except Exception as exc:
+                logger.warning("reply_permission failed (%s): %s", pid, exc)
+
+    @staticmethod
+    def _keyboard_approve(req: dict) -> str:
+        """Render one permission request on the terminal and read y/a/n."""
+        kind = req.get("permission", "unknown")
+        patterns = req.get("patterns") or []
+        meta = req.get("metadata") or {}
+        detail = meta.get("command") or meta.get("filepath") or meta.get("url") or ""
+        print()
+        print("=" * 60)
+        print(f"  [PERMISSION REQUEST] {kind}")
+        if patterns:
+            print(f"  patterns : {patterns}")
+        if detail:
+            print(f"  detail   : {detail}")
+        print("=" * 60)
+        while True:
+            try:
+                ans = input("Approve? [y]=once  [a]=always  [n]=reject > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return "reject"
+            if ans in ("", "y", "yes"):
+                return "once"
+            if ans in ("a", "always"):
+                return "always"
+            if ans in ("n", "no", "reject"):
+                return "reject"
 
     def command(self, cmd: str, args: str = "", *, agent: Optional[str] = None, timeout_ms: int = 600_000) -> str:
         """Execute a registered slash command (e.g. ``/kernel-opt``) and return
@@ -901,9 +965,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--task", default="Optimize this kernel for better performance on Hopper.",
                        help="Task description for the agent")
     p_run.add_argument("--max-iter", type=int, default=5, help="Max optimization iterations")
-    p_run.add_argument("--timeout-min", type=float, default=30.0,
+    p_run.add_argument("--timeout-min", type=float, default=45.0,
                        help="Per-iteration prompt timeout in minutes (default: 30; "
                             "subagent edits+compiles+benches kernels, keep it generous)")
+    p_run.add_argument("--no-approve", action="store_true",
+                       help="Disable interactive keyboard approval of opencode "
+                            "permission requests (default: approve y/a/n when on a TTY)")
     p_run.add_argument("--port", type=int, default=DEFAULT_PORT)
     p_run.add_argument("--host", default=DEFAULT_HOST)
     p_run.add_argument("--agent", default="kernel-dev", help="opencode agent name")
@@ -970,7 +1037,10 @@ def main() -> None:
             agent.stop_server()
 
     elif args.command == "harness":
-        agent = KernelAgent(port=args.port, host=args.host)
+        agent = KernelAgent(
+            port=args.port, host=args.host,
+            interactive_permissions=not args.no_approve,
+        )
         if not agent.wait_for_server():
             logger.error("cannot connect to opencode server at %s", agent.base_url)
             sys.exit(1)
