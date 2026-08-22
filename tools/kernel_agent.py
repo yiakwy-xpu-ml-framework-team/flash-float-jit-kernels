@@ -1,24 +1,23 @@
 """
-kernel_agent.py — GPU Kernel Development Agent Orchestrator
+kernel_agent.py : GPU JIT Kernel Harnessing Agent Orchestrator
 
-A Python-based agent that coordinates with a headless opencode server
-(REST API) to write, verify, and optimize CUDA/Triton kernels on Hopper.
+A Python-based remote GPU JIT (H800 sm90a/DgxSpark sm120a /MacStudio Metal GPU) Kernel Harnessing agent that coordinates with a headless opencode server
+with REST API to write, verify, and optimize CUDA/Hip/Metal/Triton kernels on Hopper and other platforms (coming soon).
 
 Architecture:
-    kernel_agent.py  ──REST──►  opencode serve :8096
-                               (reads .opencode, uses skills, tool calls)
+    kernel_agent.py supports opencode serve RESTful API at port :8096 (reads .opencode, uses skills, tool calls)
 
     The agent drives:
     1. Session management  (create, prompt, abort)
-    2. Kernel write/modify  (via opencode agent)
-    3. Safety harness       (5-stage correctness verification)
-    4. Benchmark            (performance measurement)
-    5. Optimize loop        (write → verify → bench → keep/revert)
+    2. Kernel write/modify (via opencode agent)
+    3. Safety verify       (5-stage correctness verification)
+    4. Benchmark           (performance measurement)
+    5. Harness loop        (write → verify → bench → keep/revert)
 
 Usage:
     python tools/kernel_agent.py serve --port 8096
-    python tools/kernel_agent.py run --kernel jit_kernel/csrc/thunder_moun/symm_gemm.cu
-    python tools/kernel_agent.py harness --kernel tools/example_kernel.py
+    python tools/kernel_agent.py harness --kernel jit_kernel/thunder_moun.py
+    python tools/kernel_agent.py verify --kernel tools/example_kernel.py
     python tools/kernel_agent.py benchmark --kernel tools/example_kernel.py
 """
 
@@ -45,7 +44,7 @@ logger = logging.getLogger("kernel_agent")
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# H800 DGX SupperPod Constants
 # ---------------------------------------------------------------------------
 
 H100_PEAK_TFLOPS_FP16 = 989.5
@@ -159,7 +158,7 @@ def verify_correctness(spec: OperatorSpec, inputs: tuple) -> tuple[bool, str]:
     return True, ""
 
 
-def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
+def run_safety_verification(spec: OperatorSpec) -> HarnessResult:
     """Run the 5-stage correctness harness on *spec*.
 
     Stages:
@@ -438,7 +437,7 @@ def load_operator_spec(
 # ---------------------------------------------------------------------------
 
 class KernelAgent:
-    """Orchestrates kernel development via the opencode REST API.
+    """Orchestrates kernel Harnessing via the opencode REST API.
 
     Lifecycle:
         1. start_server()     — launch ``opencode serve --port <port>``
@@ -554,9 +553,15 @@ class KernelAgent:
 
     # -- kernel-specific operations ------------------------------------------
 
-    def write_kernel(self, task: str, *, agent: str = "kernel-dev") -> str:
-        """Ask opencode to write/modify a kernel. Returns the reply text."""
-        return self.prompt(task, agent=agent)
+    def write_kernel(self, task: str, *, agent: str = "kernel-dev",
+                     timeout_ms: int = 1_800_000) -> str:
+        """Ask opencode to write/modify a kernel. Returns the reply text.
+
+        ``kernel-dev`` runs as a multi-step subagent (read → edit → nvcc
+        compile → benchmark), so a single iteration regularly takes 5-20
+        minutes; the 30-minute default avoids premature client timeouts.
+        """
+        return self.prompt(task, agent=agent, timeout_ms=timeout_ms)
 
     def revert_last(self) -> bool:
         """Revert the last message in the session."""
@@ -578,7 +583,7 @@ class KernelAgent:
         if spec is None:
             return HarnessResult(False, "load", f"cannot load kernel spec: {kernel_path}")
         spec.num_inputs = num_inputs
-        return run_safety_harness(spec)
+        return run_safety_verification(spec)
 
     # -- benchmark (local) ---------------------------------------------------
 
@@ -601,6 +606,7 @@ class KernelAgent:
         *,
         max_iterations: int = 5,
         agent: str = "kernel-dev",
+        prompt_timeout_ms: int = 1_800_000,
     ) -> list[dict]:
         """Run the full optimization loop.
 
@@ -635,10 +641,15 @@ class KernelAgent:
                 f"Current best: {best_time_us:.1f} us" if best_time_us else task
             )
             try:
-                reply = self.write_kernel(iteration_task, agent=agent)
+                reply = self.write_kernel(iteration_task, agent=agent,
+                                          timeout_ms=prompt_timeout_ms)
                 logger.info("agent reply (%d chars): %s", len(reply), reply[:200])
             except Exception as exc:
                 logger.error("agent prompt failed: %s", exc)
+                # The agent may still be running server-side (e.g. client
+                # timeout) — abort it so it can't collide with the next
+                # iteration's prompt in the same session.
+                self.client.abort_session(self._session_id)
                 results.append({"iteration": i, "phase": "prompt", "error": str(exc)})
                 continue
 
@@ -766,7 +777,7 @@ def build_harness_report(
     return "\n".join(lines)
 
 
-def run_harness_standalone(
+def run_safety_verification_standalone(
     kernel_path: str,
     *,
     n: int = 4096,
@@ -777,7 +788,7 @@ def run_harness_standalone(
 
     Flow:
         1. Load operator spec (kernel fn + optional reference fn)
-        2. Run the 5-stage correctness harness (reference-verified)
+        2. Run the 5-stage correctness verification (reference-verified)
         3. If correctness passes, benchmark with triton.testing.do_bench
         4. Persist the report to ``harness_<kernel_name>.md``
     """
@@ -792,7 +803,7 @@ def run_harness_standalone(
     print(f"  File:      {kernel_path}")
     print(f"  Reference: {spec.ref_fn.__name__ if spec.ref_fn else '(none — crash-only)'}")
 
-    result = run_safety_harness(spec)
+    result = run_safety_verification(spec)
 
     print(f"  Passed:  {result.passed}")
     if not result.passed:
@@ -873,7 +884,7 @@ def run_benchmark_standalone(kernel_path: str, n: int = 4096, device: str = "aut
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="GPU Kernel Development Agent Orchestrator",
+        description="GPU Kernel Harnessing Agent Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -885,17 +896,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default=DEFAULT_HOST)
 
     # run (optimize loop)
-    p_run = sub.add_parser("run", help="Run the full optimization loop")
+    p_run = sub.add_parser("harness", help="Run the full optimization loop")
     p_run.add_argument("--kernel", required=True, help="Path to kernel file")
     p_run.add_argument("--task", default="Optimize this kernel for better performance on Hopper.",
                        help="Task description for the agent")
     p_run.add_argument("--max-iter", type=int, default=5, help="Max optimization iterations")
+    p_run.add_argument("--timeout-min", type=float, default=30.0,
+                       help="Per-iteration prompt timeout in minutes (default: 30; "
+                            "subagent edits+compiles+benches kernels, keep it generous)")
     p_run.add_argument("--port", type=int, default=DEFAULT_PORT)
     p_run.add_argument("--host", default=DEFAULT_HOST)
     p_run.add_argument("--agent", default="kernel-dev", help="opencode agent name")
 
     # harness
-    p_harness = sub.add_parser("harness", help="Run safety harness on a kernel")
+    p_harness = sub.add_parser("verify", help="Run safety harness on a kernel")
     p_harness.add_argument("--kernel", required=True, help="Path to kernel file")
     p_harness.add_argument("-n", type=int, default=4096, help="Benchmark input size")
     p_harness.add_argument("--output-dir", default=None,
@@ -955,7 +969,7 @@ def main() -> None:
         finally:
             agent.stop_server()
 
-    elif args.command == "run":
+    elif args.command == "harness":
         agent = KernelAgent(port=args.port, host=args.host)
         if not agent.wait_for_server():
             logger.error("cannot connect to opencode server at %s", agent.base_url)
@@ -964,6 +978,7 @@ def main() -> None:
         results = agent.optimize_loop(
             args.kernel, args.task,
             max_iterations=args.max_iter, agent=args.agent,
+            prompt_timeout_ms=int(args.timeout_min * 60_000),
         )
         # Save results
         out_path = ROOT / "experiments" / f"{pathlib.Path(args.kernel).stem}_results.json"
@@ -971,8 +986,8 @@ def main() -> None:
         out_path.write_text(json.dumps(results, indent=2))
         logger.info("results saved to %s", out_path)
 
-    elif args.command == "harness":
-        run_harness_standalone(args.kernel, n=args.n, output_dir=args.output_dir, device=args.device)
+    elif args.command == "verify":
+        run_safety_verification_standalone(args.kernel, n=args.n, output_dir=args.output_dir, device=args.device)
 
     elif args.command == "benchmark":
         run_benchmark_standalone(args.kernel, n=args.n, device=args.device)
