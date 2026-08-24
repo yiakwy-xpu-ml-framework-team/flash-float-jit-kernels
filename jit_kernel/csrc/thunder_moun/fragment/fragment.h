@@ -24,7 +24,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 
 #ifndef SWIZZLE_64B_STORE
 
-#define SWIZZLE_64B_STORE 0
+#define SWIZZLE_64B_STORE 1
 
 #endif
 
@@ -219,7 +219,7 @@ struct FragmentView {
 
                     int src_idx, dst_idx;
 
-                    // NOTE(yiakwy) : only valid for 16x16 fragment
+                    // NOTE(erke) : Inplace Swizzle not available yet
 #if SWIZZLE_64B_STORE
                     int swizzle_col = thr_col ^ (thr_row % 8);
                     int swizzle_row = thr_row ^ (thr_col % 8);

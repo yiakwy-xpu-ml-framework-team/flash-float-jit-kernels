@@ -36,7 +36,7 @@ namespace cg = cooperative_groups;
 
 #define USE_CLUSTER_MULTICAST 1
 
-#define USE_INPALCE_TRI_TRANSPOSE 1
+#define USE_INPALCE_TRI_TRANSPOSE 0
 
 namespace xpu {
 
@@ -119,6 +119,13 @@ struct HopperPersistentSplitKPipeline {
 
         constexpr int SCLAE_BLOCK_SIZE_K = 128;
         constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
+
+        //prepare for swizzle
+        constexpr int SWIZZLE_BYTES = 128;
+        constexpr int ELEMENTS_PER_PANEL = SWIZZLE_BYTES / sizeof(OutDtype);
+        
+        constexpr int PANELS_PER_ROW = BN / ELEMENTS_PER_PANEL;
+        constexpr uint32_t PANEL_BYTES = BM * ELEMENTS_PER_PANEL * sizeof(OutDtype);
 
         /*
         __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
@@ -507,15 +514,38 @@ struct HopperPersistentSplitKPipeline {
 
 #else
 
-                    static_assert(SWIZZLE_64B_STORE == 0,
-                                  "out-of-place transpose only supports row-major TMA stores.");
-                    frag_view.transpose_8x8(shmem_transpose);
+                    frag_view.transpose(shmem_transpose);
+                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    __syncthreads();
 
                     if (threadIdx.x == 0) {
+
+#if SWIZZLE_64B_STORE
+                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
+#else
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
+#endif // SWIZZLE_64B_STORE
 
                         uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_transpose[0]));
 
+#if SWIZZLE_64B_STORE //support fp16 and fp32
+                        #pragma unroll
+                        for (int panel_idx = 0; panel_idx < PANELS_PER_ROW; ++panel_idx) {
+
+                            uint32_t smem_panel_addr = smem_epilogue_addr + panel_idx * PANEL_BYTES;
+
+                            asm volatile (
+                                "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                                " [%0, {%2, %3}], [%1];"
+                                :
+                                : "l"(tma_o_addr), "r"(smem_panel_addr),
+                                "r"(block_idx_m * BN + panel_idx * ELEMENTS_PER_PANEL), 
+                                "r"(block_idx_n * BM)
+                                : "memory"
+                            );
+                        }
+                        
+#else
                         asm volatile (
                             "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
                             " [%0, {%2, %3}], [%1];"
@@ -524,7 +554,9 @@ struct HopperPersistentSplitKPipeline {
                               "r"(block_idx_m * BN), "r"(block_idx_n * BM)
                             : "memory"
                         );
+#endif // SWIZZLE_64B_STORE
                         asm volatile("cp.async.bulk.commit_group;");
+
                     } // outplace copy
 
                 // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
