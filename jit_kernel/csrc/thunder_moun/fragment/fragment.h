@@ -296,23 +296,20 @@ struct FragmentView {
 
     }
 
-    __device__ __forceinline__ static uint32_t warp_transpose_8x8_half2(uint32_t packed, int lane_id) {
+    __device__ __forceinline__ static half2 warp_transpose_8x8_half2(half2 packed, int lane_id) {
         const int out_row = lane_id / 4;
         const int out_pair = lane_id % 4;
 
         const int source_pair = out_row / 2;
         const int half_select = out_row % 2;
-        const int bit_shift = half_select * 16;
 
         const int source_lane_0 = (2 * out_pair) * 4 + source_pair;
         const int source_lane_1 = (2 * out_pair + 1) * 4 + source_pair;
 
-        const uint32_t word_0 = __shfl_sync(0xffffffffu, packed, source_lane_0);
-        const uint32_t word_1 = __shfl_sync(0xffffffffu, packed, source_lane_1);
+        const half2 word_0 = __shfl_sync(0xffffffffu, packed, source_lane_0);
+        const half2 word_1 = __shfl_sync(0xffffffffu, packed, source_lane_1);
 
-        const uint32_t value_0 = (word_0 >> bit_shift) & 0xffffu;
-        const uint32_t value_1 = (word_1 >> bit_shift) & 0xffffu;
-        return value_0 | (value_1 << 16);
+        return half_select == 0 ? __lows2half2(word_0, word_1) : __highs2half2(word_0, word_1);
     }
 
     // Experimental row-major-only transpose using a direct 8x8 tiling.
@@ -356,14 +353,14 @@ struct FragmentView {
                 const int src_idx = (sub_frag_idx_m_off + lane_row) * BM + sub_frag_idx_n_off + local_col;
                 const int dst_idx = (sub_frag_idx_n_off + lane_row) * BM + sub_frag_idx_m_off + local_col;
 
-                const uint32_t src_old = *reinterpret_cast<const uint32_t*>(shared_ptr + src_idx);
-                const uint32_t dst_old = *reinterpret_cast<const uint32_t*>(shared_ptr + dst_idx);
+                const half2 src_old = *reinterpret_cast<const half2*>(shared_ptr + src_idx);
+                const half2 dst_old = *reinterpret_cast<const half2*>(shared_ptr + dst_idx);
 
-                const uint32_t src_t = warp_transpose_8x8_half2(src_old, lane_id);
-                const uint32_t dst_t = warp_transpose_8x8_half2(dst_old, lane_id);
+                const half2 src_t = warp_transpose_8x8_half2(src_old, lane_id);
+                const half2 dst_t = warp_transpose_8x8_half2(dst_old, lane_id);
 
-                *reinterpret_cast<uint32_t*>(shared_ptr + src_idx) = dst_t;
-                *reinterpret_cast<uint32_t*>(shared_ptr + dst_idx) = src_t;
+                *reinterpret_cast<half2*>(shared_ptr + src_idx) = dst_t;
+                *reinterpret_cast<half2*>(shared_ptr + dst_idx) = src_t;
             }
         }
 
@@ -378,12 +375,12 @@ struct FragmentView {
                 const int packed_idx =
                     (sub_frag_idx_m_off + lane_row) * BM + sub_frag_idx_n_off + local_col;
 
-                const uint32_t old_value =
-                    *reinterpret_cast<const uint32_t*>(shared_ptr + packed_idx);
-                const uint32_t transposed =
+                const half2 old_value =
+                    *reinterpret_cast<const half2*>(shared_ptr + packed_idx);
+                const half2 transposed =
                     warp_transpose_8x8_half2(old_value, lane_id);
 
-                *reinterpret_cast<uint32_t*>(shared_ptr + packed_idx) = transposed;
+                *reinterpret_cast<half2*>(shared_ptr + packed_idx) = transposed;
             }
         }
 
@@ -429,12 +426,12 @@ struct FragmentView {
                 const int dst_idx =
                     (sub_frag_idx_n_off + thr_row) * BM + sub_frag_idx_m_off + thr_col;
 
-                const uint32_t old_value =
-                    *reinterpret_cast<const uint32_t*>(shared_ptr + src_idx);
-                const uint32_t transposed =
+                const half2 old_value =
+                    *reinterpret_cast<const half2*>(shared_ptr + src_idx);
+                const half2 transposed =
                     warp_transpose_8x8_half2(old_value, lane_id);
 
-                *reinterpret_cast<uint32_t*>(dst_shared_ptr + dst_idx) = transposed;
+                *reinterpret_cast<half2*>(dst_shared_ptr + dst_idx) = transposed;
             }
         }
 
