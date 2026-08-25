@@ -464,7 +464,7 @@ struct HopperPersistentSplitKPipeline {
                     __syncthreads();
 
                     // NOTE (yiakwy) : inplace transpose
-                    frag_view._transpose_8x8();
+                    frag_view._transpose_opt();
 
                     if (threadIdx.x == 0) {
 
@@ -515,8 +515,6 @@ struct HopperPersistentSplitKPipeline {
 #else
 
                     frag_view.transpose(shmem_transpose);
-                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-                    __syncthreads();
 
                     if (threadIdx.x == 0) {
 
