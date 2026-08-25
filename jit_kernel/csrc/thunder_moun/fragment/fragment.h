@@ -517,7 +517,7 @@ struct FragmentView {
 
         } // end of sub_frag_idx_m
 
-        _warpgroup_sync(wg_id);
+        // _warpgroup_sync(wg_id);
 
         #pragma unroll
         for (int task_idx = 0; task_idx < M_STEPS; task_idx++) {
@@ -553,7 +553,7 @@ struct FragmentView {
 
         } // end of task_idx
 
-        _warpgroup_sync(wg_id);
+        // _warpgroup_sync(wg_id);
 
     }
 };
