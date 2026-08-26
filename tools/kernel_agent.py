@@ -453,6 +453,7 @@ class KernelAgent:
         host: str = DEFAULT_HOST,
         project_dir: Optional[str] = None,
         interactive_permissions: bool = False,
+        auto_approve_permissions: bool = False,
     ) -> None:
         self.port = port
         self.host = host
@@ -463,6 +464,7 @@ class KernelAgent:
         self._session_id: Optional[str] = None
         self._history: list[dict] = []
         self.interactive_permissions = interactive_permissions
+        self.auto_approve_permissions = auto_approve_permissions
         self._answered_permissions: set[str] = set()
 
     # -- server lifecycle ----------------------------------------------------
@@ -535,16 +537,18 @@ class KernelAgent:
     def prompt(self, text: str, *, agent: Optional[str] = None, timeout_ms: int = 300_000) -> str:
         """Send a prompt and wait for the reply. Returns the text.
 
-        When ``interactive_permissions`` is on, pending permission requests
-        (opencode ``action.action=ask``) are serviced from the keyboard
-        while waiting, instead of stalling the loop forever.
+        Permission requests (opencode ``action.action=ask``) are serviced while
+        waiting: interactively from the keyboard when ``interactive_permissions``
+        is on, or automatically ("once") when ``auto_approve_permissions`` is on.
+        With both off (headless, no TTY), a pending request stalls the loop until
+        the prompt timeout — prefer --approve-all for unattended runs.
         """
         logger.info("prompting session %s (%d chars)", self.session_id, len(text))
-        hook = (
-            self._service_permission_asks
-            if self.interactive_permissions and sys.stdin.isatty()
-            else None
-        )
+        hook: Optional[Callable[[], None]] = None
+        if self.auto_approve_permissions:
+            hook = self._service_permission_asks
+        elif self.interactive_permissions and sys.stdin.isatty():
+            hook = self._service_permission_asks
         reply = self.client.send_and_wait(
             self.session_id, text, agent=agent, timeout_ms=timeout_ms, poll_hook=hook
         )
@@ -554,7 +558,8 @@ class KernelAgent:
     # -- interactive permission approval ----------------------------------
 
     def _service_permission_asks(self) -> None:
-        """Ask the operator (keyboard) to approve/reject pending permissions."""
+        """Service pending permission requests: auto-approve ("once") when
+        ``auto_approve_permissions`` is on, otherwise ask the operator."""
         try:
             pending = [
                 p for p in self.client.list_permissions()
@@ -567,7 +572,7 @@ class KernelAgent:
             if not pid or pid in self._answered_permissions:
                 continue
             self._answered_permissions.add(pid)
-            reply = self._keyboard_approve(req)
+            reply = "once" if self.auto_approve_permissions else self._keyboard_approve(req)
             try:
                 self.client.reply_permission(pid, reply)
                 logger.info("permission %s (%s): %s", pid, req.get("permission"), reply)
@@ -639,6 +644,41 @@ class KernelAgent:
             return self.client.revert_message(self.session_id, msg_id)
         return False
 
+    # -- file snapshot / restore (robust alternative to revert_last) ---------
+
+    _SNAPSHOT_DIRS = ("jit_kernel", "benchmark")
+
+    def snapshot_tree(self, tag: str) -> Optional[pathlib.Path]:
+        """Tar the kernel source trees so a failed iteration can be restored
+        deterministically (revert_last only undoes ONE session message while the
+        agent may have edited files across many). Returns the archive path."""
+        import tarfile
+
+        base = ROOT / "experiments" / "snapshots"
+        base.mkdir(parents=True, exist_ok=True)
+        arc = base / f"{tag}.tar.gz"
+        with tarfile.open(arc, "w:gz") as tar:
+            for d in self._SNAPSHOT_DIRS:
+                path = ROOT / d
+                if path.exists():
+                    tar.add(path, arcname=d)
+        return arc
+
+    def restore_tree(self, tag: str) -> bool:
+        """Restore the source trees from a snapshot taken by ``snapshot_tree``."""
+        import tarfile
+
+        arc = ROOT / "experiments" / "snapshots" / f"{tag}.tar.gz"
+        if not arc.exists():
+            logger.warning("no snapshot %s to restore", arc)
+            return False
+        with tarfile.open(arc, "r:gz") as tar:
+            # Only extract over our own tree members; never follow absolute paths.
+            members = [m for m in tar.getmembers() if m.name.split("/")[0] in self._SNAPSHOT_DIRS]
+            tar.extractall(ROOT, members=members)
+        logger.info("restored snapshot %s", arc.name)
+        return True
+
     # -- safety harness (local, no opencode needed) --------------------------
 
     def check_kernel(self, kernel_path: str, num_inputs: int = 2) -> HarnessResult:
@@ -663,6 +703,66 @@ class KernelAgent:
 
     # -- optimization loop ---------------------------------------------------
 
+    def _build_context_block(self, kernel_path: str, baseline: Optional[BenchResult],
+                             baseline_sol: Optional[dict]) -> str:
+        """Repo + baseline scaffolding injected into EVERY iteration prompt.
+
+        Without it the agent burns its budget rediscovering the file map, the
+        baseline numbers and the verification command every round (the #1 cause
+        of "no effective changes + timeout").
+        """
+        lines = [
+            "## Environment (fixed for all iterations)",
+            f"- Kernel under test: `{kernel_path}` (repo root = cwd)",
+            "- Verification command (run before claiming ANY improvement):",
+            f"  `python tools/kernel_agent.py verify --kernel {kernel_path}`",
+            "- Benchmark scripts live under `benchmark/` (see the one matching this op).",
+            "- Debugging methodology: follow the `kernel-debug-probes` skill — write a",
+            "  minimal standalone probe under `sandbox/probes/probe_<conjecture>.py` to",
+            "  isolate ONE hypothesis BEFORE re-editing the kernel; keep the probe.",
+            "- Change exactly ONE thing per iteration; end your reply with a line:",
+            '  `RESULT: {"decision":"keep|revert","time_us":<float>,"files":[...],"probes":[...],"next_hypothesis":"..."}`',
+        ]
+        if baseline is not None and baseline_sol is not None:
+            lines.append(
+                f"- Baseline: {baseline.time_us:.1f} us | SOL {baseline_sol['t_sol_us']:.1f} us "
+                f"| gap {baseline_sol['sol_gap']:.2f}x ({baseline_sol['classification']})"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_outcome_block(last_result: Optional[dict]) -> str:
+        """Feed the PREVIOUS iteration outcome back to the agent.
+
+        This is the feedback half of the loop: without it the agent never learns
+        why its last change was rejected and keeps proposing ineffective edits.
+        """
+        if not last_result:
+            return ""
+        phase = last_result.get("phase", "")
+        lines = ["\n## Previous iteration outcome"]
+        if phase == "harness":
+            lines += [
+                f"- **Verification FAILED** at stage `{last_result.get('stage')}`:",
+                f"  `{last_result.get('detail')}`",
+                "- Files were restored to the last good state. Diagnose with a probe",
+                "  (kernel-debug-probes skill) BEFORE editing again.",
+            ]
+        elif phase == "revert":
+            lines += [
+                f"- Kept-out: new time {last_result.get('time_us', float('nan')):.1f} us did NOT beat"
+                f" best {last_result.get('best_us', float('nan')):.1f} us. Files restored.",
+                "- Pick a DIFFERENT hypothesis; consider a profiling probe first.",
+            ]
+        elif phase == "keep":
+            lines.append(f"- KEEPED: {last_result.get('speedup_pct', 0):.1f}% faster.")
+        elif phase == "prompt":
+            lines += [
+                f"- **Prompt failed**: {last_result.get('error', '')[:300]}",
+                "- Work only on the single highest-value step; avoid long tool chains.",
+            ]
+        return "\n".join(lines)
+
     def optimize_loop(
         self,
         kernel_path: str,
@@ -678,7 +778,9 @@ class KernelAgent:
         1. Ask opencode to optimize the kernel
         2. Run safety harness locally
         3. Benchmark locally
-        4. Keep if faster + correct, revert otherwise
+        4. Keep if faster + correct, restore snapshot otherwise
+        Every prompt carries (a) fixed environment context and (b) the previous
+        iteration's outcome, so failures actually reach the agent.
         """
         results: list[dict] = []
         best_time_us: Optional[float] = None
@@ -686,36 +788,82 @@ class KernelAgent:
         # Baseline benchmark
         logger.info("=== Baseline measurement ===")
         base_result = self.bench_kernel(kernel_path)
+        baseline_sol = None
         if base_result:
             best_time_us = base_result.time_us
-            sol = compute_sol_gap(base_result)
+            baseline_sol = compute_sol_gap(base_result)
             logger.info(
                 "baseline: %.1f us, SOL gap: %.1f×, %s",
-                sol["time_us"], sol["sol_gap"], sol["classification"],
+                baseline_sol["time_us"], baseline_sol["sol_gap"], baseline_sol["classification"],
             )
-            results.append({"iteration": 0, "phase": "baseline", **sol})
+            results.append({"iteration": 0, "phase": "baseline", **baseline_sol})
+
+        context_block = self._build_context_block(kernel_path, base_result, baseline_sol)
+        last_outcome: Optional[dict] = None
+        consecutive_conn_failures = 0
 
         for i in range(1, max_iterations + 1):
             logger.info("=== Iteration %d/%d ===", i, max_iterations)
 
-            # 1. Ask opencode to optimize
+            outcome_block = self._build_outcome_block(last_outcome)
+            best_txt = f"{best_time_us:.1f}" if best_time_us else "?"
             iteration_task = (
-                f"{task}\n\n"
-                f"Iteration {i}/{max_iterations}. "
-                f"Current best: {best_time_us:.1f} us" if best_time_us else task
+                f"{context_block}\n"
+                f"{outcome_block}\n\n"
+                f"## Task\n{task}\n\n"
+                f"Iteration {i}/{max_iterations}. Current best: {best_txt} us."
             )
+
+            tag = f"iter_{i}_pre"
+            self.snapshot_tree(tag)
+
             try:
                 reply = self.write_kernel(iteration_task, agent=agent,
                                           timeout_ms=prompt_timeout_ms)
                 logger.info("agent reply (%d chars): %s", len(reply), reply[:200])
+                consecutive_conn_failures = 0
+            except TimeoutError as exc:
+                # Capture whatever the agent produced so far and feed it forward.
+                partial = ""
+                try:
+                    msgs = self.client.list_messages(self._session_id)
+                    found = self.client._find_reply(msgs)
+                    if found:
+                        partial = self.client._extract_text(found)[:2000]
+                except Exception:
+                    pass
+                logger.error("agent prompt timed out after %d ms; partial reply %d chars",
+                             prompt_timeout_ms, len(partial))
+                results.append({"iteration": i, "phase": "prompt",
+                                "error": str(exc), "partial_reply": partial})
+                last_outcome = {"phase": "prompt", "error": f"timeout; partial: {partial[-400:]}"}
+                # The agent may still be running server-side — abort so the next
+                # prompt does not collide, but do NOT assume the server died.
+                try:
+                    self.client.abort_session(self._session_id)
+                except Exception:
+                    pass
+                continue
             except Exception as exc:
                 logger.error("agent prompt failed: %s", exc)
-                # The agent may still be running server-side (e.g. client
-                # timeout) — abort it so it can't collide with the next
-                # iteration's prompt in the same session.
-                self.client.abort_session(self._session_id)
                 results.append({"iteration": i, "phase": "prompt", "error": str(exc)})
-                continue
+                last_outcome = {"phase": "prompt", "error": str(exc)}
+                # Distinguish dead-server from transient errors; restart once.
+                if not self.client.ping():
+                    consecutive_conn_failures += 1
+                    logger.warning("opencode server unreachable (fail #%d) — restarting",
+                                   consecutive_conn_failures)
+                    self.start_server()
+                    if not self.wait_for_server():
+                        logger.error("server still down; stopping loop")
+                        break
+                    continue
+                else:
+                    try:
+                        self.client.abort_session(self._session_id)
+                    except Exception:
+                        pass
+                    continue
 
             # 2. Safety harness
             harness = self.check_kernel(kernel_path)
@@ -725,15 +873,20 @@ class KernelAgent:
                     "iteration": i, "phase": "harness",
                     "passed": False, "stage": harness.stage, "detail": harness.detail,
                 })
-                # Revert the bad edit
-                self.revert_last()
+                # Restore the last-good sources (deterministic; revert_last only
+                # undoes a single session message).
+                self.restore_tree(tag)
+                last_outcome = {"phase": "harness", "stage": harness.stage,
+                                "detail": harness.detail}
                 continue
 
             # 3. Benchmark
             bench = self.bench_kernel(kernel_path)
             if bench is None:
                 results.append({"iteration": i, "phase": "bench", "error": "benchmark failed"})
-                self.revert_last()
+                self.restore_tree(tag)
+                last_outcome = {"phase": "harness", "stage": "bench",
+                                "detail": "benchmark crashed"}
                 continue
 
             sol = compute_sol_gap(bench)
@@ -742,18 +895,22 @@ class KernelAgent:
                 i, sol["time_us"], sol["sol_gap"],
             )
 
-            # 4. Keep or revert
+            # 4. Keep or restore
             if best_time_us is not None and sol["time_us"] < best_time_us * 0.98:
                 # Faster — keep
                 speedup = (1 - sol["time_us"] / best_time_us) * 100
                 logger.info("KEEP — %.1f%% faster", speedup)
                 best_time_us = sol["time_us"]
                 results.append({"iteration": i, "phase": "keep", "speedup_pct": speedup, **sol})
+                last_outcome = {"phase": "keep", "speedup_pct": speedup}
             else:
-                # No improvement — revert
+                # No improvement — restore
                 logger.info("REVERT — no improvement (%.1f us vs %.1f us)", sol["time_us"], best_time_us or 0)
-                self.revert_last()
-                results.append({"iteration": i, "phase": "revert", **sol})
+                self.restore_tree(tag)
+                results.append({"iteration": i, "phase": "revert",
+                                **sol, "best_us": best_time_us or 0})
+                last_outcome = {"phase": "revert", "time_us": sol["time_us"],
+                                "best_us": best_time_us or 0}
 
         logger.info("=== Optimization complete. Best: %.1f us ===", best_time_us or 0)
         return results
@@ -962,15 +1119,27 @@ def build_parser() -> argparse.ArgumentParser:
     # run (optimize loop)
     p_run = sub.add_parser("harness", help="Run the full optimization loop")
     p_run.add_argument("--kernel", required=True, help="Path to kernel file")
-    p_run.add_argument("--task", default="Optimize this kernel for better performance on Hopper.",
-                       help="Task description for the agent")
+    p_run.add_argument(
+        "--task",
+        default=(
+            "Improve the kernel's performance on H800 (sm90a). "
+            "Pick ONE bottleneck hypothesis per iteration; if correctness failed "
+            "last round, first isolate it with a minimal probe under sandbox/probes/ "
+            "(kernel-debug-probes skill) instead of re-editing blindly. Verify with "
+            "the verification command above before reporting."
+        ),
+        help="Task description for the agent (environment/baseline/outcome context "
+             "is injected automatically around it)",
+    )
     p_run.add_argument("--max-iter", type=int, default=5, help="Max optimization iterations")
     p_run.add_argument("--timeout-min", type=float, default=45.0,
-                       help="Per-iteration prompt timeout in minutes (default: 30; "
+                       help="Per-iteration prompt timeout in minutes (default: 45; "
                             "subagent edits+compiles+benches kernels, keep it generous)")
     p_run.add_argument("--no-approve", action="store_true",
-                       help="Disable interactive keyboard approval of opencode "
-                            "permission requests (default: approve y/a/n when on a TTY)")
+                       help="Disable keyboard approval of opencode permission requests")
+    p_run.add_argument("--approve-all", action="store_true",
+                       help="Auto-approve every permission request (recommended for "
+                            "unattended/headless runs; avoids stalls until timeout)")
     p_run.add_argument("--port", type=int, default=DEFAULT_PORT)
     p_run.add_argument("--host", default=DEFAULT_HOST)
     p_run.add_argument("--agent", default="kernel-dev", help="opencode agent name")
@@ -1039,7 +1208,8 @@ def main() -> None:
     elif args.command == "harness":
         agent = KernelAgent(
             port=args.port, host=args.host,
-            interactive_permissions=not args.no_approve,
+            interactive_permissions=not args.no_approve and not args.approve_all,
+            auto_approve_permissions=args.approve_all,
         )
         if not agent.wait_for_server():
             logger.error("cannot connect to opencode server at %s", agent.base_url)
