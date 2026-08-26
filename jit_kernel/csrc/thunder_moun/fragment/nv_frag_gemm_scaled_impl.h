@@ -181,7 +181,7 @@ struct HopperWGMMAAccumulator {
                 int row, col;
                 int _ = getTargetWgmmaSmemOffset(wg_id, wg_lane_id, i, m_step, M_STEPS, &row, &col);
 
-                float scale = xs[k_offset * BM + row] * _ws;
+                float scale = xs[k_offset * (BM + 1) + row] * _ws;
 
                 regs[m_step][i] *= scale;
             }
@@ -198,6 +198,52 @@ struct HopperWGMMAAccumulator {
             #pragma unroll
             for (int i = 0; i < kRegistersPerThread; ++i) {
                 this->regs[m_step][i] += b.regs[m_step][i];
+            }
+        }
+    }
+
+    __device__ inline void fma_scaled_(const HopperWGMMAAccumulator& local, float* xs, float* ws, int k_offset = 0) {
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        // const int lane_id = threadIdx.x % WARP_SIZE;
+
+        const int wg_id = warp_id / WARP_GROUP;
+        const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
+
+        const int wgs = blockDim.x / WARP_GROUP_SIZE;
+        const int M_STEPS = BM / FRAG_M / wgs;
+
+        float _ws = ws[k_offset];
+
+        const int warp_id_in_wg = wg_lane_id / WARP_SIZE;
+        const int lane_id = wg_lane_id % WARP_SIZE;
+
+        #pragma unroll
+        for (int m_step = 0; m_step < M_STEPS; ++m_step) {
+            const int row0 =
+                wg_id * FRAG_M * M_STEPS
+                + m_step * FRAG_M
+                + warp_id_in_wg * 16
+                + lane_id / 4;
+
+            const int row1 = row0 + 8;
+
+            const float scale0 = xs[k_offset * (BM + 1) + row0] * _ws;
+            const float scale1 = xs[k_offset * (BM + 1) + row1] * _ws;
+
+            #pragma unroll
+            for (int i = 0; i < (kRegistersPerThread / 4); ++i) {
+                const int base = 4 * i;
+                this->regs[m_step][base + 0] =
+                    __fmaf_rn(local.regs[m_step][base + 0], scale0, this->regs[m_step][base + 0]);
+
+                this->regs[m_step][base + 1] =
+                    __fmaf_rn(local.regs[m_step][base + 1], scale0, this->regs[m_step][base + 1]);
+
+                this->regs[m_step][base + 2] =
+                    __fmaf_rn(local.regs[m_step][base + 2], scale1, this->regs[m_step][base + 2]);
+
+                this->regs[m_step][base + 3] =
+                    __fmaf_rn(local.regs[m_step][base + 3], scale1, this->regs[m_step][base + 3]);
             }
         }
     }

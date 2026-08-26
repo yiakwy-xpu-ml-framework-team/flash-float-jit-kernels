@@ -142,7 +142,7 @@ def symm_gemm_block_scaled(
     SCALE_BLOCK_SIZE_K: int = 128,
     check_input_shape: bool = False,
     use_mxfp8: bool = False,
-    algorithm: str = "wasp_1p2c",  # "multi_stage", # "wasp_1p2c",
+    algorithm: str = "wasp_1p2c",  # "multi_stage"
 ) -> torch.Tensor:
     """
     Thunder Moun Optimizer CUDA Kernel
