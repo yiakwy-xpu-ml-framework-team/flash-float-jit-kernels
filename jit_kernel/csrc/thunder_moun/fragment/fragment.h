@@ -122,7 +122,6 @@ struct FragmentView {
 
         } // end of sub_frag_idx_m
 
-        // __syncthreads();
         _warpgroup_sync(wg_id);
 
         #pragma unroll
@@ -163,7 +162,6 @@ struct FragmentView {
 
         } // end of task_idx
 
-        // __syncthreads();
         _warpgroup_sync(wg_id);
 
     }

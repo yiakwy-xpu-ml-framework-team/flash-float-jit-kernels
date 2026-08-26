@@ -63,6 +63,12 @@ _PY_SYMBOL = "symmetric_gemm_fp8_block_scaled"
 
 common_cuda_flags = ["-O2", "-std=c++17"]
 
+# NOTE (yiakwy) : FLASH_FLOAT_BULK_SPLITK=1 switches the on-chip split-K reduction
+USE_BULK_SPLITK = False
+if os.environ.get("FLASH_FLOAT_BULK_SPLITK", "0") == "1":
+    common_cuda_flags += ["-DUSE_BULK_SPLITK_REDUCE=1"]
+    USE_BULK_SPLITK = True
+
 
 if torch.cuda.is_available():
     major, _minor = torch.cuda.get_device_capability()
@@ -204,8 +210,8 @@ def symm_gemm_block_scaled(
 
     split_k = max(1, K // BLK_K)
 
-    # NOTE (yiakwy) : disable on chip split_k reduction via NoC for the moment
-    split_k = 1
+    if USE_BULK_SPLITK:
+        split_k = min(split_k, 4) # maximum 4 for split_k, and at least 2 for cluster multicast
 
     if out is None:
         out = torch.empty(

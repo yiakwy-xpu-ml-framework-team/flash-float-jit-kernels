@@ -147,94 +147,6 @@ struct HopperWGMMAAccumulator {
         __syncwarp();
     }
 
-    // Packed row-major store.
-    //
-    // A WGMMA thread's registers come in float2 pairs {regs[4i+0], regs[4i+1]}
-    // and {regs[4i+2], regs[4i+3]} that map to two *adjacent columns* of the
-    // same row (see getTargetWgmmaSmemOffset; (col, col+1) at (row) and at
-    // (row+8) respectively), so each pair converts to one half2 and lands in
-    // smem with a single 32-bit STS. This halves the shared-store instruction
-    // count on the epilogue critical path vs the scalar store() above.
-    template<typename Dtype>
-    __device__ inline void store_packed(Dtype* smem) {
-        static_assert(sizeof(Dtype) == 2, "packed store expects a 2-byte dtype");
-
-        const int warp_id = threadIdx.x / WARP_SIZE;
-
-        const int wg_id = warp_id / WARP_GROUP;
-        const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
-
-        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
-
-        const int M_STEPS = BM / FRAG_M / wgs;
-
-        #pragma unroll
-        for (int m_step = 0; m_step < M_STEPS; ++m_step) {
-            #pragma unroll
-            for (int i = 0; i < kRegistersPerThread; i += 4) {
-                int row, col;
-                getTargetWgmmaSmemOffset(wg_id, wg_lane_id, i, m_step, M_STEPS, &row, &col);
-
-                if constexpr (!std::is_same_v<Dtype, AccDtype>) {
-                    *reinterpret_cast<__half2 *>(&smem[row * BN + col]) =
-                        __floats2half2_rn(regs[m_step][i + 0], regs[m_step][i + 1]);
-                    *reinterpret_cast<__half2 *>(&smem[(row + 8) * BN + col]) =
-                        __floats2half2_rn(regs[m_step][i + 2], regs[m_step][i + 3]);
-                } else {
-                    *reinterpret_cast<float2 *>(&smem[row * BN + col]) =
-                        make_float2(regs[m_step][i + 0], regs[m_step][i + 1]);
-                    *reinterpret_cast<float2 *>(&smem[(row + 8) * BN + col]) =
-                        make_float2(regs[m_step][i + 2], regs[m_step][i + 3]);
-                }
-            }
-        }
-        __syncwarp();
-    }
-
-    // Transposed (a.k.a. "output transpose path") register-direct scatter:
-    //     smem_T[col * BM + row] = acc(row, col)
-    // i.e. the fragment is written *transposed* into a plain row-major smem
-    // tile. This is exactly the smem layout consumed by the out-of-place
-    // transpose TMA store (desc_O_trans, swapped tile coordinates), so the
-    // epilogue no longer needs the shared-memory read-modify-write
-    // FragmentView::_transpose (nor the tma_store_wait that guards it) -- the
-    // normal + transposed TMA stores can be issued back to back in a single
-    // bulk group.
-    //
-    // Columns of the threaded fragment map to rows of smem_T; a warp's lanes
-    // spread over (row/2) % 32 banks, so the scatter is ~4-way word-conflicted
-    // -- still far cheaper than a smem->smem transpose round trip.
-    template<typename Dtype>
-    __device__ inline void store_transposed(Dtype* smem_T) {
-        static_assert(sizeof(Dtype) == 2, "transposed store expects a 2-byte dtype");
-        static_assert(BM == BN, "transposed store expects a square tile");
-
-        const int warp_id = threadIdx.x / WARP_SIZE;
-
-        const int wg_id = warp_id / WARP_GROUP;
-        const int wg_lane_id = threadIdx.x % WARP_GROUP_SIZE;
-
-        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
-
-        const int M_STEPS = BM / FRAG_M / wgs;
-
-        #pragma unroll
-        for (int m_step = 0; m_step < M_STEPS; ++m_step) {
-            #pragma unroll
-            for (int i = 0; i < kRegistersPerThread; ++i) {
-                int row, col;
-                getTargetWgmmaSmemOffset(wg_id, wg_lane_id, i, m_step, M_STEPS, &row, &col);
-
-                if constexpr (!std::is_same_v<Dtype, AccDtype>) {
-                    smem_T[col * BM + row] = static_cast<Dtype>(regs[m_step][i]);
-                } else {
-                    smem_T[col * BM + row] = regs[m_step][i];
-                }
-            }
-        }
-        __syncwarp();
-    }
-
     __device__ inline void mul_(float scale) {
         constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
 
@@ -290,7 +202,46 @@ struct HopperWGMMAAccumulator {
         }
     }
 
+    template <typename AccType>
+    static __device__ __forceinline__ void scaled_add(
+        AccType& accum, const AccType& step,
+        const float* __restrict__ shmem_XS, const float* __restrict__ shmem_WS,
+        int k_offset)
+    {
+        constexpr int FRAG_M = 64;
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
+        constexpr int M_STEPS = AccType::BM / FRAG_M / wgs;
+        constexpr int kRegs = AccType::kRegistersPerThread;
+
+        const int wg_id = (threadIdx.x / WARP_SIZE) / WARP_GROUP;
+        const int warp_in_wg = (threadIdx.x % WARP_GROUP_SIZE) / WARP_SIZE;
+        const int lane_in_wg = threadIdx.x % WARP_SIZE;
+
+        const float ws = shmem_WS[k_offset];
+        const float* xs_base = shmem_XS + k_offset * AccType::BM;
+
+        // NOTE (yiakwy) : equivalent to logics of HopperWGMMAAccumulator::getTargetWgmmaSmemOffset
+        const int row = wg_id * (FRAG_M * M_STEPS) +
+                            warp_in_wg * (FRAG_M / WARP_GROUP) +
+                            lane_in_wg / 4;
+
+        #pragma unroll
+        for (int m = 0; m < M_STEPS; ++m) {
+            const float sx0 = xs_base[row + m * FRAG_M] * ws;
+            const float sx1 = xs_base[row + m * FRAG_M + 8] * ws;
+
+            #pragma unroll
+            for (int i = 0; i < kRegs; i += 4) {
+                accum.regs[m][i + 0] = fmaf(step.regs[m][i + 0], sx0, accum.regs[m][i + 0]);
+                accum.regs[m][i + 1] = fmaf(step.regs[m][i + 1], sx0, accum.regs[m][i + 1]);
+                accum.regs[m][i + 2] = fmaf(step.regs[m][i + 2], sx1, accum.regs[m][i + 2]);
+                accum.regs[m][i + 3] = fmaf(step.regs[m][i + 3], sx1, accum.regs[m][i + 3]);
+            }
+        }
+    }
+
 };
+
 
 union TmaDesc {
     uint64_t desc_;
@@ -476,38 +427,154 @@ struct HopperWGMMAExecutor {
                         : "l"(desc_x), "l"(desc_w)
                     );
 
-                    // asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-                    // asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-
-                    // // if (threadIdx.x == 255 && blockIdx.x == 1 && blockIdx.y == 2) {
-                    // if (threadIdx.x == 255 && blockIdx.x == 0 && blockIdx.y == 0) {
-                    //     printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] [k_step#%d] reg[%d ~ %d] = \n", wg_id, m_step, k_step, reg_offset, reg_offset + reg_num_per_frag - 1);
-                    //     for (int i = 0; i < 64; ++i) {
-                    //         printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] [k_step#%d] RegAcc[%d] = %f \n", wg_id, m_step, k_step, i, reg_ptr[reg_offset + i]);
-                    //     }
-                    //     printf("\n");
-                    // }
-                    // _warpgroup_sync_256();
-
                 } // K_STEPS
-
-                    // asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-                    // asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-
-                    // // if (threadIdx.x == 255 && blockIdx.x == 1 && blockIdx.y == 2) {
-                    // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-                    //     printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] reg[%d ~ %d] = \n", wg_id, m_step, reg_offset, reg_offset + reg_num_per_frag - 1);
-                    //     for (int i = 0; i < 64; ++i) {
-                    //         printf("[HopperWGMMAExecutor::mma_scaled] [wg_id#%d] [m_step#%d] RegAcc[%d] = %f \n", wg_id, m_step, i, reg_ptr[reg_offset + i]);
-                    //     }
-                    //     printf("\n");
-                    // }
-                    // _warpgroup_sync_256();
 
             } // N_STEPS
 
         } // M_STEPS
     }
+
+
+    template <typename AccType>
+    static __device__ __forceinline__ void mma_scaled_interleaved_commit(
+        AccType& accum, uint32_t smem_x_ptr, uint32_t smem_w_ptr)
+    {
+        constexpr int FRAG_M = 64;
+        constexpr int FRAG_N = 128;
+        constexpr int FRAG_K = 32;
+
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int wg_id = warp_id / WARP_GROUP;
+
+        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
+
+        constexpr int M_STEPS = AccType::BM / FRAG_M / wgs;
+        constexpr int N_STEPS = AccType::BN / FRAG_N;
+        constexpr int K_STEPS = AccType::BK / FRAG_K;
+
+        float* reg_ptr = accum.get_reg_ptr();
+
+        constexpr uint32_t reg_num_per_frag = AccType::kRegistersPerThread;
+
+        constexpr uint32_t swizzle_stride_x = 8 * AccType::BK;
+        constexpr uint32_t swizzle_stride_w = 8 * AccType::BK;
+
+        // TODO (yiakwy) : nvgpu::arch::wgmma_fence_sync_aligned()
+        asm volatile(
+            "wgmma.fence.sync.aligned;\n" ::: "memory"
+        );
+
+        #pragma unroll
+        for (int m_step = 0; m_step < M_STEPS; ++m_step) {
+            uint32_t m_wg_stride_bytes_off_X =
+                wg_id * M_STEPS * FRAG_M * AccType::BK;
+
+            uint32_t m_frag_stride_bytes_off_X =
+                m_step * FRAG_M * AccType::BK;
+
+            uint32_t current_smem_x = smem_x_ptr +
+                m_frag_stride_bytes_off_X +
+                m_wg_stride_bytes_off_X;
+
+            #pragma unroll
+            for (int n_step = 0; n_step < N_STEPS; ++n_step) {
+                int reg_offset = (m_step * N_STEPS + n_step) * reg_num_per_frag;
+
+                uint32_t n_frag_stride_bytes_off_W =
+                    n_step * FRAG_N * AccType::BK;
+                uint32_t current_smem_w = smem_w_ptr + n_frag_stride_bytes_off_W;
+
+                constexpr uint32_t desc_off = (uint32_t)FRAG_K;
+
+                #pragma unroll
+                for (int k_step = 0; k_step < K_STEPS; ++k_step) {
+                    uint32_t addr_x = current_smem_x + k_step * desc_off;
+                    uint32_t addr_w = current_smem_w + k_step * desc_off;
+
+                    uint64_t desc_x = make_smem_desc(addr_x, 1, 0, swizzle_stride_x);
+                    uint64_t desc_w = make_smem_desc(addr_w, 1, 0, swizzle_stride_w);
+
+                    // scale-d literal: k_step==0 -> d = A*B (zero-init), else d += A*B
+                    if (k_step == 0) {
+                        asm volatile (
+                            "{\n"
+                            "  wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3\n"
+                            "  {\n"
+                            "   %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, \n"
+                            "   %8,  %9,  %10, %11, %12, %13, %14, %15,\n"
+                            "   %16, %17, %18, %19, %20, %21, %22, %23,\n"
+                            "   %24, %25, %26, %27, %28, %29, %30, %31,\n"
+                            "   %32, %33, %34, %35, %36, %37, %38, %39,\n"
+                            "   %40, %41, %42, %43, %44, %45, %46, %47,\n"
+                            "   %48, %49, %50, %51, %52, %53, %54, %55,\n"
+                            "   %56, %57, %58, %59, %60, %61, %62, %63\n"
+                            "  },\n"
+                            "  %64, %65, "
+                            "  0, 1, 1;\n"
+                            "}\n"
+                            :
+                            "+f"(reg_ptr[reg_offset + 0]),  "+f"(reg_ptr[reg_offset + 1]),  "+f"(reg_ptr[reg_offset + 2]),  "+f"(reg_ptr[reg_offset + 3]),
+                            "+f"(reg_ptr[reg_offset + 4]),  "+f"(reg_ptr[reg_offset + 5]),  "+f"(reg_ptr[reg_offset + 6]),  "+f"(reg_ptr[reg_offset + 7]),
+                            "+f"(reg_ptr[reg_offset + 8]),  "+f"(reg_ptr[reg_offset + 9]),  "+f"(reg_ptr[reg_offset + 10]), "+f"(reg_ptr[reg_offset + 11]),
+                            "+f"(reg_ptr[reg_offset + 12]), "+f"(reg_ptr[reg_offset + 13]), "+f"(reg_ptr[reg_offset + 14]), "+f"(reg_ptr[reg_offset + 15]),
+                            "+f"(reg_ptr[reg_offset + 16]), "+f"(reg_ptr[reg_offset + 17]), "+f"(reg_ptr[reg_offset + 18]), "+f"(reg_ptr[reg_offset + 19]),
+                            "+f"(reg_ptr[reg_offset + 20]), "+f"(reg_ptr[reg_offset + 21]), "+f"(reg_ptr[reg_offset + 22]), "+f"(reg_ptr[reg_offset + 23]),
+                            "+f"(reg_ptr[reg_offset + 24]), "+f"(reg_ptr[reg_offset + 25]), "+f"(reg_ptr[reg_offset + 26]), "+f"(reg_ptr[reg_offset + 27]),
+                            "+f"(reg_ptr[reg_offset + 28]), "+f"(reg_ptr[reg_offset + 29]), "+f"(reg_ptr[reg_offset + 30]), "+f"(reg_ptr[reg_offset + 31]),
+                            "+f"(reg_ptr[reg_offset + 32]), "+f"(reg_ptr[reg_offset + 33]), "+f"(reg_ptr[reg_offset + 34]), "+f"(reg_ptr[reg_offset + 35]),
+                            "+f"(reg_ptr[reg_offset + 36]), "+f"(reg_ptr[reg_offset + 37]), "+f"(reg_ptr[reg_offset + 38]), "+f"(reg_ptr[reg_offset + 39]),
+                            "+f"(reg_ptr[reg_offset + 40]), "+f"(reg_ptr[reg_offset + 41]), "+f"(reg_ptr[reg_offset + 42]), "+f"(reg_ptr[reg_offset + 43]),
+                            "+f"(reg_ptr[reg_offset + 44]), "+f"(reg_ptr[reg_offset + 45]), "+f"(reg_ptr[reg_offset + 46]), "+f"(reg_ptr[reg_offset + 47]),
+                            "+f"(reg_ptr[reg_offset + 48]), "+f"(reg_ptr[reg_offset + 49]), "+f"(reg_ptr[reg_offset + 50]), "+f"(reg_ptr[reg_offset + 51]),
+                            "+f"(reg_ptr[reg_offset + 52]), "+f"(reg_ptr[reg_offset + 53]), "+f"(reg_ptr[reg_offset + 54]), "+f"(reg_ptr[reg_offset + 55]),
+                            "+f"(reg_ptr[reg_offset + 56]), "+f"(reg_ptr[reg_offset + 57]), "+f"(reg_ptr[reg_offset + 58]), "+f"(reg_ptr[reg_offset + 59]),
+                            "+f"(reg_ptr[reg_offset + 60]), "+f"(reg_ptr[reg_offset + 61]), "+f"(reg_ptr[reg_offset + 62]), "+f"(reg_ptr[reg_offset + 63])
+                            : "l"(desc_x), "l"(desc_w)
+                        );
+                    } else {
+                        asm volatile (
+                            "{\n"
+                            "  wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3\n"
+                            "  {\n"
+                            "   %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, \n"
+                            "   %8,  %9,  %10, %11, %12, %13, %14, %15,\n"
+                            "   %16, %17, %18, %19, %20, %21, %22, %23,\n"
+                            "   %24, %25, %26, %27, %28, %29, %30, %31,\n"
+                            "   %32, %33, %34, %35, %36, %37, %38, %39,\n"
+                            "   %40, %41, %42, %43, %44, %45, %46, %47,\n"
+                            "   %48, %49, %50, %51, %52, %53, %54, %55,\n"
+                            "   %56, %57, %58, %59, %60, %61, %62, %63\n"
+                            "  },\n"
+                            "  %64, %65, "
+                            "  1, 1, 1;\n"
+                            "}\n"
+                            :
+                            "+f"(reg_ptr[reg_offset + 0]),  "+f"(reg_ptr[reg_offset + 1]),  "+f"(reg_ptr[reg_offset + 2]),  "+f"(reg_ptr[reg_offset + 3]),
+                            "+f"(reg_ptr[reg_offset + 4]),  "+f"(reg_ptr[reg_offset + 5]),  "+f"(reg_ptr[reg_offset + 6]),  "+f"(reg_ptr[reg_offset + 7]),
+                            "+f"(reg_ptr[reg_offset + 8]),  "+f"(reg_ptr[reg_offset + 9]),  "+f"(reg_ptr[reg_offset + 10]), "+f"(reg_ptr[reg_offset + 11]),
+                            "+f"(reg_ptr[reg_offset + 12]), "+f"(reg_ptr[reg_offset + 13]), "+f"(reg_ptr[reg_offset + 14]), "+f"(reg_ptr[reg_offset + 15]),
+                            "+f"(reg_ptr[reg_offset + 16]), "+f"(reg_ptr[reg_offset + 17]), "+f"(reg_ptr[reg_offset + 18]), "+f"(reg_ptr[reg_offset + 19]),
+                            "+f"(reg_ptr[reg_offset + 20]), "+f"(reg_ptr[reg_offset + 21]), "+f"(reg_ptr[reg_offset + 22]), "+f"(reg_ptr[reg_offset + 23]),
+                            "+f"(reg_ptr[reg_offset + 24]), "+f"(reg_ptr[reg_offset + 25]), "+f"(reg_ptr[reg_offset + 26]), "+f"(reg_ptr[reg_offset + 27]),
+                            "+f"(reg_ptr[reg_offset + 28]), "+f"(reg_ptr[reg_offset + 29]), "+f"(reg_ptr[reg_offset + 30]), "+f"(reg_ptr[reg_offset + 31]),
+                            "+f"(reg_ptr[reg_offset + 32]), "+f"(reg_ptr[reg_offset + 33]), "+f"(reg_ptr[reg_offset + 34]), "+f"(reg_ptr[reg_offset + 35]),
+                            "+f"(reg_ptr[reg_offset + 36]), "+f"(reg_ptr[reg_offset + 37]), "+f"(reg_ptr[reg_offset + 38]), "+f"(reg_ptr[reg_offset + 39]),
+                            "+f"(reg_ptr[reg_offset + 40]), "+f"(reg_ptr[reg_offset + 41]), "+f"(reg_ptr[reg_offset + 42]), "+f"(reg_ptr[reg_offset + 43]),
+                            "+f"(reg_ptr[reg_offset + 44]), "+f"(reg_ptr[reg_offset + 45]), "+f"(reg_ptr[reg_offset + 46]), "+f"(reg_ptr[reg_offset + 47]),
+                            "+f"(reg_ptr[reg_offset + 48]), "+f"(reg_ptr[reg_offset + 49]), "+f"(reg_ptr[reg_offset + 50]), "+f"(reg_ptr[reg_offset + 51]),
+                            "+f"(reg_ptr[reg_offset + 52]), "+f"(reg_ptr[reg_offset + 53]), "+f"(reg_ptr[reg_offset + 54]), "+f"(reg_ptr[reg_offset + 55]),
+                            "+f"(reg_ptr[reg_offset + 56]), "+f"(reg_ptr[reg_offset + 57]), "+f"(reg_ptr[reg_offset + 58]), "+f"(reg_ptr[reg_offset + 59]),
+                            "+f"(reg_ptr[reg_offset + 60]), "+f"(reg_ptr[reg_offset + 61]), "+f"(reg_ptr[reg_offset + 62]), "+f"(reg_ptr[reg_offset + 63])
+                            : "l"(desc_x), "l"(desc_w)
+                        );
+                    }
+                } // K_STEPS
+            } // N_STEPS
+        } // M_STEPS
+
+        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+    }
+
 
     static __device__ inline void commit_and_wait() {
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");

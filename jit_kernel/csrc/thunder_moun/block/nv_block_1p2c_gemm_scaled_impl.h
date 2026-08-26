@@ -36,6 +36,11 @@ namespace cg = cooperative_groups;
 
 #define USE_CLUSTER_MULTICAST 1
 
+// NOTE (yiakwy) : set to 1 to enable bulk-DMA reduction (cp.async.bulk.shared::cluster) via vectorized half2 (simd_vadd); toggle with FLASH_FLOAT_BULK_SPLITK=1
+#ifndef USE_BULK_SPLITK_REDUCE
+#define USE_BULK_SPLITK_REDUCE 1
+#endif
+
 #define USE_INPALCE_TRI_TRANSPOSE 1
 
 #ifndef CONSUMER_THREADS
@@ -111,228 +116,6 @@ static __device__ __forceinline__ void simd_vadd(half2* dst, const half2* src) {
 } //  namespace nvgpu
 
 namespace xpu {
-
-    // Consumer-side mbarrier phase wait, executed by ALL threads of the
-    // consumer warpgroup (CUTLASS PipelineTmaAsync::consumer_wait style).
-    //
-    // Replaces the previous "lane-0 spins with nanosleep(64) + named
-    // barrier.sync(128)" pattern, which put 3 of 4 warps to sleep on a named
-    // barrier and added up to ~64ns of nanosleep wake overshoot on the
-    // critical path of EVERY k-tile (the NCU-dominant `stalled_barrier`).
-    //
-    // Correctness:
-    //  - mbarrier phase completion publishes the async-proxy (TMA) writes to
-    //    every thread that observes the flip, so no bar.sync / fence is
-    //    needed after the wait.
-    //  - All warps of the warpgroup execute this same instruction stream, so
-    //    the subsequent ".sync.aligned" WGMMA ops are legal and re-dock the
-    //    warps at issue time.
-    static __device__ __forceinline__ void consumer_full_barrier_wait(uint32_t bar_addr, int phase) {
-        asm volatile(
-            "{\n"
-            ".reg .pred P;\n"
-            "WAIT_LOOP:\n"
-            "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
-            "@P bra.uni DONE;\n"
-            "bra.uni WAIT_LOOP;\n"
-            "DONE:\n"
-            "}\n" :: "r"(bar_addr), "r"(phase) : "memory");
-    }
-
-    // Issue one BK-deep WGMMA batch (M_STEPS x N_STEPS x K_STEPS instructions)
-    // into `accum` WITHOUT an explicit clear(): the k_step==0 instruction uses
-    // scale-d = 0 (d = A*B), the remaining k-steps use scale-d = 1 (d += A*B).
-    // A wgmma.commit_group closes the batch so the caller can pipeline with
-    // wgmma.wait_group (e.g. overlap batch k+1 on the tensor core with the
-    // FP8 block-scale promotion FFMAs of batch k on the CUDA cores).
-    template <typename AccType>
-    static __device__ __forceinline__ void wgmma_batch_commit(
-        AccType& accum, uint32_t smem_x_ptr, uint32_t smem_w_ptr)
-    {
-        constexpr int FRAG_M = 64;
-        constexpr int FRAG_N = 128;
-        constexpr int FRAG_K = 32;
-
-        const int warp_id = threadIdx.x / WARP_SIZE;
-        const int wg_id = warp_id / WARP_GROUP;
-
-        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
-
-        constexpr int M_STEPS = AccType::BM / FRAG_M / wgs;
-        constexpr int N_STEPS = AccType::BN / FRAG_N;
-        constexpr int K_STEPS = AccType::BK / FRAG_K;
-
-        float* reg_ptr = accum.get_reg_ptr();
-
-        constexpr uint32_t reg_num_per_frag = AccType::kRegistersPerThread;
-
-        constexpr uint32_t swizzle_stride_x = 8 * AccType::BK;
-        constexpr uint32_t swizzle_stride_w = 8 * AccType::BK;
-
-        // NOTE : register (WAR/RAW) hazards between the generic proxy and the
-        // async proxy are ordered by this fence (see PTX ISA, wgmma.fence).
-        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-
-#if defined(ABL_NO_WGMMA) && ABL_NO_WGMMA
-        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        return;
-#endif
-
-        #pragma unroll
-        for (int m_step = 0; m_step < M_STEPS; ++m_step) {
-            uint32_t m_wg_stride_bytes_off_X =
-                wg_id * M_STEPS * FRAG_M * AccType::BK;
-
-            uint32_t m_frag_stride_bytes_off_X =
-                m_step * FRAG_M * AccType::BK;
-
-            uint32_t current_smem_x = smem_x_ptr +
-                m_frag_stride_bytes_off_X +
-                m_wg_stride_bytes_off_X;
-
-            #pragma unroll
-            for (int n_step = 0; n_step < N_STEPS; ++n_step) {
-                int reg_offset = (m_step * N_STEPS + n_step) * reg_num_per_frag;
-
-                uint32_t n_frag_stride_bytes_off_W =
-                    n_step * FRAG_N * AccType::BK;
-                uint32_t current_smem_w = smem_w_ptr + n_frag_stride_bytes_off_W;
-
-                constexpr uint32_t desc_off = (uint32_t)FRAG_K;
-
-                #pragma unroll
-                for (int k_step = 0; k_step < K_STEPS; ++k_step) {
-                    uint32_t addr_x = current_smem_x + k_step * desc_off;
-                    uint32_t addr_w = current_smem_w + k_step * desc_off;
-
-                    uint64_t desc_x = make_smem_desc(addr_x, 1, 0, swizzle_stride_x);
-                    uint64_t desc_w = make_smem_desc(addr_w, 1, 0, swizzle_stride_w);
-
-                    // scale-d literal: k_step==0 -> d = A*B (zero-init), else d += A*B
-                    if (k_step == 0) {
-                        asm volatile (
-                            "{\n"
-                            "  wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3\n"
-                            "  {\n"
-                            "   %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, \n"
-                            "   %8,  %9,  %10, %11, %12, %13, %14, %15,\n"
-                            "   %16, %17, %18, %19, %20, %21, %22, %23,\n"
-                            "   %24, %25, %26, %27, %28, %29, %30, %31,\n"
-                            "   %32, %33, %34, %35, %36, %37, %38, %39,\n"
-                            "   %40, %41, %42, %43, %44, %45, %46, %47,\n"
-                            "   %48, %49, %50, %51, %52, %53, %54, %55,\n"
-                            "   %56, %57, %58, %59, %60, %61, %62, %63\n"
-                            "  },\n"
-                            "  %64, %65, "
-                            "  0, 1, 1;\n"
-                            "}\n"
-                            :
-                            "+f"(reg_ptr[reg_offset + 0]),  "+f"(reg_ptr[reg_offset + 1]),  "+f"(reg_ptr[reg_offset + 2]),  "+f"(reg_ptr[reg_offset + 3]),
-                            "+f"(reg_ptr[reg_offset + 4]),  "+f"(reg_ptr[reg_offset + 5]),  "+f"(reg_ptr[reg_offset + 6]),  "+f"(reg_ptr[reg_offset + 7]),
-                            "+f"(reg_ptr[reg_offset + 8]),  "+f"(reg_ptr[reg_offset + 9]),  "+f"(reg_ptr[reg_offset + 10]), "+f"(reg_ptr[reg_offset + 11]),
-                            "+f"(reg_ptr[reg_offset + 12]), "+f"(reg_ptr[reg_offset + 13]), "+f"(reg_ptr[reg_offset + 14]), "+f"(reg_ptr[reg_offset + 15]),
-                            "+f"(reg_ptr[reg_offset + 16]), "+f"(reg_ptr[reg_offset + 17]), "+f"(reg_ptr[reg_offset + 18]), "+f"(reg_ptr[reg_offset + 19]),
-                            "+f"(reg_ptr[reg_offset + 20]), "+f"(reg_ptr[reg_offset + 21]), "+f"(reg_ptr[reg_offset + 22]), "+f"(reg_ptr[reg_offset + 23]),
-                            "+f"(reg_ptr[reg_offset + 24]), "+f"(reg_ptr[reg_offset + 25]), "+f"(reg_ptr[reg_offset + 26]), "+f"(reg_ptr[reg_offset + 27]),
-                            "+f"(reg_ptr[reg_offset + 28]), "+f"(reg_ptr[reg_offset + 29]), "+f"(reg_ptr[reg_offset + 30]), "+f"(reg_ptr[reg_offset + 31]),
-                            "+f"(reg_ptr[reg_offset + 32]), "+f"(reg_ptr[reg_offset + 33]), "+f"(reg_ptr[reg_offset + 34]), "+f"(reg_ptr[reg_offset + 35]),
-                            "+f"(reg_ptr[reg_offset + 36]), "+f"(reg_ptr[reg_offset + 37]), "+f"(reg_ptr[reg_offset + 38]), "+f"(reg_ptr[reg_offset + 39]),
-                            "+f"(reg_ptr[reg_offset + 40]), "+f"(reg_ptr[reg_offset + 41]), "+f"(reg_ptr[reg_offset + 42]), "+f"(reg_ptr[reg_offset + 43]),
-                            "+f"(reg_ptr[reg_offset + 44]), "+f"(reg_ptr[reg_offset + 45]), "+f"(reg_ptr[reg_offset + 46]), "+f"(reg_ptr[reg_offset + 47]),
-                            "+f"(reg_ptr[reg_offset + 48]), "+f"(reg_ptr[reg_offset + 49]), "+f"(reg_ptr[reg_offset + 50]), "+f"(reg_ptr[reg_offset + 51]),
-                            "+f"(reg_ptr[reg_offset + 52]), "+f"(reg_ptr[reg_offset + 53]), "+f"(reg_ptr[reg_offset + 54]), "+f"(reg_ptr[reg_offset + 55]),
-                            "+f"(reg_ptr[reg_offset + 56]), "+f"(reg_ptr[reg_offset + 57]), "+f"(reg_ptr[reg_offset + 58]), "+f"(reg_ptr[reg_offset + 59]),
-                            "+f"(reg_ptr[reg_offset + 60]), "+f"(reg_ptr[reg_offset + 61]), "+f"(reg_ptr[reg_offset + 62]), "+f"(reg_ptr[reg_offset + 63])
-                            : "l"(desc_x), "l"(desc_w)
-                        );
-                    } else {
-                        asm volatile (
-                            "{\n"
-                            "  wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3\n"
-                            "  {\n"
-                            "   %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, \n"
-                            "   %8,  %9,  %10, %11, %12, %13, %14, %15,\n"
-                            "   %16, %17, %18, %19, %20, %21, %22, %23,\n"
-                            "   %24, %25, %26, %27, %28, %29, %30, %31,\n"
-                            "   %32, %33, %34, %35, %36, %37, %38, %39,\n"
-                            "   %40, %41, %42, %43, %44, %45, %46, %47,\n"
-                            "   %48, %49, %50, %51, %52, %53, %54, %55,\n"
-                            "   %56, %57, %58, %59, %60, %61, %62, %63\n"
-                            "  },\n"
-                            "  %64, %65, "
-                            "  1, 1, 1;\n"
-                            "}\n"
-                            :
-                            "+f"(reg_ptr[reg_offset + 0]),  "+f"(reg_ptr[reg_offset + 1]),  "+f"(reg_ptr[reg_offset + 2]),  "+f"(reg_ptr[reg_offset + 3]),
-                            "+f"(reg_ptr[reg_offset + 4]),  "+f"(reg_ptr[reg_offset + 5]),  "+f"(reg_ptr[reg_offset + 6]),  "+f"(reg_ptr[reg_offset + 7]),
-                            "+f"(reg_ptr[reg_offset + 8]),  "+f"(reg_ptr[reg_offset + 9]),  "+f"(reg_ptr[reg_offset + 10]), "+f"(reg_ptr[reg_offset + 11]),
-                            "+f"(reg_ptr[reg_offset + 12]), "+f"(reg_ptr[reg_offset + 13]), "+f"(reg_ptr[reg_offset + 14]), "+f"(reg_ptr[reg_offset + 15]),
-                            "+f"(reg_ptr[reg_offset + 16]), "+f"(reg_ptr[reg_offset + 17]), "+f"(reg_ptr[reg_offset + 18]), "+f"(reg_ptr[reg_offset + 19]),
-                            "+f"(reg_ptr[reg_offset + 20]), "+f"(reg_ptr[reg_offset + 21]), "+f"(reg_ptr[reg_offset + 22]), "+f"(reg_ptr[reg_offset + 23]),
-                            "+f"(reg_ptr[reg_offset + 24]), "+f"(reg_ptr[reg_offset + 25]), "+f"(reg_ptr[reg_offset + 26]), "+f"(reg_ptr[reg_offset + 27]),
-                            "+f"(reg_ptr[reg_offset + 28]), "+f"(reg_ptr[reg_offset + 29]), "+f"(reg_ptr[reg_offset + 30]), "+f"(reg_ptr[reg_offset + 31]),
-                            "+f"(reg_ptr[reg_offset + 32]), "+f"(reg_ptr[reg_offset + 33]), "+f"(reg_ptr[reg_offset + 34]), "+f"(reg_ptr[reg_offset + 35]),
-                            "+f"(reg_ptr[reg_offset + 36]), "+f"(reg_ptr[reg_offset + 37]), "+f"(reg_ptr[reg_offset + 38]), "+f"(reg_ptr[reg_offset + 39]),
-                            "+f"(reg_ptr[reg_offset + 40]), "+f"(reg_ptr[reg_offset + 41]), "+f"(reg_ptr[reg_offset + 42]), "+f"(reg_ptr[reg_offset + 43]),
-                            "+f"(reg_ptr[reg_offset + 44]), "+f"(reg_ptr[reg_offset + 45]), "+f"(reg_ptr[reg_offset + 46]), "+f"(reg_ptr[reg_offset + 47]),
-                            "+f"(reg_ptr[reg_offset + 48]), "+f"(reg_ptr[reg_offset + 49]), "+f"(reg_ptr[reg_offset + 50]), "+f"(reg_ptr[reg_offset + 51]),
-                            "+f"(reg_ptr[reg_offset + 52]), "+f"(reg_ptr[reg_offset + 53]), "+f"(reg_ptr[reg_offset + 54]), "+f"(reg_ptr[reg_offset + 55]),
-                            "+f"(reg_ptr[reg_offset + 56]), "+f"(reg_ptr[reg_offset + 57]), "+f"(reg_ptr[reg_offset + 58]), "+f"(reg_ptr[reg_offset + 59]),
-                            "+f"(reg_ptr[reg_offset + 60]), "+f"(reg_ptr[reg_offset + 61]), "+f"(reg_ptr[reg_offset + 62]), "+f"(reg_ptr[reg_offset + 63])
-                            : "l"(desc_x), "l"(desc_w)
-                        );
-                    }
-                } // K_STEPS
-            } // N_STEPS
-        } // M_STEPS
-
-        asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-    }
-
-    // Fused FP8 block-scale promotion + accumulation:
-    //     accum[m][i] = fma(step[m][i], xs[row(i)] * ws, accum[m][i])
-    //
-    // A thread's m64n128k32 fragment touches exactly two rows {r0, r0+8} per
-    // m-step (regs[4i+0/1] -> r0, regs[4i+2/3] -> r0+8), so the per-register
-    // shared-memory scale lookups of mul_()+add_() collapse to two LDS + two
-    // FMUL + 64 FFMA per k-tile (was: 64 LDS + ~200 int/fp ops + 64 FADD).
-    template <typename AccType>
-    static __device__ __forceinline__ void scaled_accumulate(
-        AccType& accum, const AccType& step,
-        const float* __restrict__ shmem_XS, const float* __restrict__ shmem_WS,
-        int k_offset)
-    {
-        constexpr int FRAG_M = 64;
-        constexpr int wgs = CONSUMER_THREADS / WARP_GROUP_SIZE;
-        constexpr int M_STEPS = AccType::BM / FRAG_M / wgs;
-        constexpr int kRegs = AccType::kRegistersPerThread;
-
-        const int wg_id = (threadIdx.x / WARP_SIZE) / WARP_GROUP;
-        const int warp_in_wg = (threadIdx.x % WARP_GROUP_SIZE) / WARP_SIZE;
-        const int lane_in_wg = threadIdx.x % WARP_SIZE;
-
-        const float ws = shmem_WS[k_offset];
-        const float* xs_base = shmem_XS + k_offset * AccType::BM;
-
-        // matches HopperWGMMAAccumulator::getTargetWgmmaSmemOffset row mapping
-        const int row0 = wg_id * (FRAG_M * M_STEPS) +
-                         warp_in_wg * (FRAG_M / WARP_GROUP) +
-                         lane_in_wg / 4;
-
-        #pragma unroll
-        for (int m = 0; m < M_STEPS; ++m) {
-            const float sx0 = xs_base[row0 + m * FRAG_M] * ws;
-            const float sx1 = xs_base[row0 + m * FRAG_M + 8] * ws;
-
-            #pragma unroll
-            for (int i = 0; i < kRegs; i += 4) {
-                accum.regs[m][i + 0] = fmaf(step.regs[m][i + 0], sx0, accum.regs[m][i + 0]);
-                accum.regs[m][i + 1] = fmaf(step.regs[m][i + 1], sx0, accum.regs[m][i + 1]);
-                accum.regs[m][i + 2] = fmaf(step.regs[m][i + 2], sx1, accum.regs[m][i + 2]);
-                accum.regs[m][i + 3] = fmaf(step.regs[m][i + 3], sx1, accum.regs[m][i + 3]);
-            }
-        }
-    }
 
 template <int BM, int BN, int BK, int STAGES, int GROUP_SIZE_M, int CLUSTER_SIZE_M>
 struct HopperPersistentSplitKPipeline {
@@ -422,6 +205,10 @@ struct HopperPersistentSplitKPipeline {
         // NOTE (yiakwy) : epilogue barrier for on chip split-k reduction
         __shared__ __align__(128) uint64_t epilogue_barriers[1];
         __shared__ __align__(128) uint64_t epilogue_readable_barriers[1];
+#if USE_BULK_SPLITK_REDUCE
+        // NOTE (yiakwy) : completion barrier of the bulk copies in split-k reduction
+        __shared__ __align__(128) uint64_t bulk_reduce_barriers[1];
+#endif
 
         if (threadIdx.x == 0) {
             #pragma unroll
@@ -443,6 +230,9 @@ struct HopperPersistentSplitKPipeline {
             if (threadIdx.x == 0) {
                 nvgpu::arch::tma_init_barrier<false>(&epilogue_barriers[0], split_k - 1);
                 nvgpu::arch::tma_init_barrier<false>(&epilogue_readable_barriers[0], split_k - 1);
+#if USE_BULK_SPLITK_REDUCE
+                nvgpu::arch::tma_init_barrier<false>(&bulk_reduce_barriers[0], 1);
+#endif
             }
         }
         nvgpu::arch::tma_store_fence();
@@ -470,7 +260,7 @@ struct HopperPersistentSplitKPipeline {
         int local_task_id = blockIdx.y;
         __syncthreads();
 
-        // NOTE (yiakwy) : batch symmetric gemm, mimicking the triton gluon XXT_kernel:
+        // NOTE (yiakwy) : batch symmetric gemm, similar to the triton gluon XXT_kernel:
         //   batch_idx = pid // (num_pid_m * num_pid_n); tile_id = pid % (num_pid_m * num_pid_n)
         //   i.e. the batch is the outter-most scheduling dimension of the linear tile id.
         const int tiles_per_batch = total_symmetric_tiles / B;
@@ -552,16 +342,13 @@ struct HopperPersistentSplitKPipeline {
             // TODO (yiakwy) : rename
             uint32_t epilogue_phase = 0;
             uint32_t epilogue_readable_phase = 0;
+#if USE_BULK_SPLITK_REDUCE
+            uint32_t bulk_reduce_phase = 0;
+#endif
 
             int offset = STAGES * (BM * BK + BN * BK);
             OutDtype* shmem_epilogue = reinterpret_cast<OutDtype *>(smem_buffer + offset);
-            // Second epilogue tile: holds the *transposed* fragment written
-            // straight from WGMMA registers (HopperWGMMAAccumulator::
-            // store_transposed), backing the out-of-place transpose TMA store
-            // (desc_O_trans). With it, the split_k==1 epilogue issues the
-            // normal + transposed stores back to back in a single bulk group;
-            // the previous tile's group is awaited at this tile's start,
-            // hiding the TMA drain behind the whole next main loop.
+
             OutDtype* shmem_epilogue_trans = shmem_epilogue + BM * BN;
             FragmentView<OutDtype, BM, BN, MemoryDomain::kShared> frag_view(shmem_epilogue);
 
@@ -572,13 +359,14 @@ struct HopperPersistentSplitKPipeline {
             auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
             auto* shmem_WS = reinterpret_cast<float*>(smem_buffer + offset + sizeof(fp32_t) * BM * K_TILES_TOTAL);
 
+#if USE_BULK_SPLITK_REDUCE
+            // NOTE (yiakwy) : bulk-DMA reduce staging buffer
+            OutDtype* splitk_staging = reinterpret_cast<OutDtype*>(shmem_XS);
+#endif
+
             xpu::HopperWGMMAAccumulator<BM, BN, BK> accum;
-            // Software pipeline: two ping-pong step accumulators keep WGMMA of
-            // k-tile k+1 on the tensor core while the FP8 block-scale promotion
-            // (FFMA) of k-tile k runs on the CUDA cores (wgmma.wait_group 1).
-            // NOTE: referenced via compile-time even/odd selection below —
-            // runtime array indexing would force the accumulators into local
-            // memory (see ptxas stack frame) and destroy performance.
+
+            // NOTE (yiakwy) : keep WGMMA of k-tile k+1 on the tensor core while scale_add (FMA) of k-tile k on CUDA cores
             xpu::HopperWGMMAAccumulator<BM, BN, BK> step_even;
             xpu::HopperWGMMAAccumulator<BM, BN, BK> step_odd;
 
@@ -586,6 +374,14 @@ struct HopperPersistentSplitKPipeline {
 
             while (local_task_id < total_symmetric_tiles) {
                 accum.clear();
+
+#if USE_BULK_SPLITK_REDUCE
+
+                if (split_k >= 2 && split_k_id == 0 && threadIdx.x == 0) {
+                    nvgpu::arch::tma_expect_bytes(&bulk_reduce_barriers[0],
+                        static_cast<uint32_t>(BM * BN * sizeof(OutDtype)));
+                }
+#endif
 
                 const int batch_idx = local_task_id / tiles_per_batch;
                 const int local_tile_id = local_task_id % tiles_per_batch;
@@ -656,34 +452,15 @@ struct HopperPersistentSplitKPipeline {
                 // consumer warp groups (was: one barrier per array)
                 warpgroup_sync();
 
-// #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-//                 if (threadIdx.x == 0 && blockIdx.x == 0) {
-//                     printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-//                 }
-//                 warpgroup_sync();
-// #endif
-
-                // 2. main loop (software pipelined, consumer warp groups are
-                //    decoupled):
-                //      prologue : wait stage(k_start), issue WGMMA batch into
-                //                 step_accum[0] (async)
-                //      iter k   : wait stage(k+1), issue WGMMA into
-                //                 step_accum[(k+1)&1] (async, overlaps step 4)
-                //               ; wgmma.wait_group <= 1 -> batch k complete
-                //               ; release stage k to the producer
-                //               ; fused scale+accumulate (FFMA) of batch k
-                //    The tensor core therefore never drains for the promotion
-                //    FFMAs, and the two consumer warp groups never barrier with
-                //    each other inside the loop (each warpgroup's threads all
-                //    spin on the TMA full barrier independently: mbarrier
-                //    phase waits are non-consuming and publish TMA data to
-                //    every observer; smem reuse is gated by the empty barrier).
+                // 2. main loop
 
                 if (k_start < k_end) {
-                    consumer_full_barrier_wait(
+                    // consumer_full_barrier_wait(
+                    nvgpu::arch::tma_wait(
                         __cvta_generic_to_shared(&barriers[read_stage]), tma_phase);
 
-                    wgmma_batch_commit(step_even,
+                    // wgmma_batch_commit(step_even,
+                    HopperWGMMAExecutor::mma_scaled_interleaved_commit(step_even,
                         __cvta_generic_to_shared(&shmem_X[read_stage]),
                         __cvta_generic_to_shared(&shmem_W[read_stage]));
                 }
@@ -700,16 +477,19 @@ struct HopperPersistentSplitKPipeline {
                         if (next_stage == STAGES) next_stage = 0;
                         const int next_phase = (next_stage == 0) ? (tma_phase ^ 1) : tma_phase;
 
-                        consumer_full_barrier_wait(
+                        // consumer_full_barrier_wait(
+                        nvgpu::arch::tma_wait(
                             __cvta_generic_to_shared(&barriers[next_stage]), next_phase);
 
                         // compile-time ping-pong buffer selection
                         if ((k_off & 1) == 0) {
-                            wgmma_batch_commit(step_odd,
+                            // wgmma_batch_commit(step_odd,
+                            HopperWGMMAExecutor::mma_scaled_interleaved_commit(step_odd,
                                 __cvta_generic_to_shared(&shmem_X[next_stage]),
                                 __cvta_generic_to_shared(&shmem_W[next_stage]));
                         } else {
-                            wgmma_batch_commit(step_even,
+                            // wgmma_batch_commit(step_even,
+                            HopperWGMMAExecutor::mma_scaled_interleaved_commit(step_even,
                                 __cvta_generic_to_shared(&shmem_X[next_stage]),
                                 __cvta_generic_to_shared(&shmem_W[next_stage]));
                         }
@@ -749,10 +529,10 @@ struct HopperPersistentSplitKPipeline {
                     }
 #else
                     if ((k_off & 1) == 0) {
-                        scaled_accumulate(accum, step_even,
+                        xpu::HopperWGMMAAccumulator<BM, BN, BK>::scaled_add(accum, step_even,
                             &shmem_XS[0], &shmem_WS[0], k_off);
                     } else {
-                        scaled_accumulate(accum, step_odd,
+                        xpu::HopperWGMMAAccumulator<BM, BN, BK>::scaled_add(accum, step_odd,
                             &shmem_XS[0], &shmem_WS[0], k_off);
                     }
 #endif
@@ -762,7 +542,7 @@ struct HopperPersistentSplitKPipeline {
                         read_stage = 0;
                         tma_phase ^= 1;
                     }
-                }
+                } // main loop
 
                 // 3. Epilogue
                 //   - first write data back to share memory for SPLIT-K reduction via NoC
@@ -804,6 +584,21 @@ struct HopperPersistentSplitKPipeline {
                 if (split_k > 1) {
                     if (split_k_id > 0) {
 
+#if USE_BULK_SPLITK_REDUCE
+                        // NOTE (yiakwy) : we tried split_k >=2 with on chip reduction, and it does not work; split-2 itself can bring 22% improvement
+                        if (split_k >= 2 && threadIdx.x == 0) {
+                            OutDtype* rank0_staging = cluster.map_shared_rank<OutDtype>(
+                                reinterpret_cast<OutDtype*>(shmem_XS), 0);
+                            uint64_t* rank0_bulk_bar =
+                                cluster.map_shared_rank<uint64_t>(&bulk_reduce_barriers[0], 0);
+                            nvgpu::arch::cluster_cp_async_bulk(
+                                rank0_staging,
+                                shmem_epilogue,
+                                static_cast<uint32_t>(BM * BN * sizeof(OutDtype)),
+                                rank0_bulk_bar);
+                        }
+#endif
+
                         if (threadIdx.x == 0) {
                             uint32_t target_cta_rank = 0;
                             mbar_arrive_cluster_release(&epilogue_barriers[0], target_cta_rank);
@@ -831,76 +626,41 @@ struct HopperPersistentSplitKPipeline {
                         }
                         warpgroup_sync();
 
-                        // TODO (yiakwy) : use nv::arch::cluster_cp_async_bulk
+#if USE_BULK_SPLITK_REDUCE
 
-//                         constexpr uint32_t reduction_size = BM * BN;
+                        // NOTE (yiakwy) : we tried split_k >=2 with on chip reduction, and it does not work; split-2 itself can bring 22% improvement
+                        if (split_k >= 2) {
+                            
+                            nvgpu::arch::tma_wait(__cvta_generic_to_shared(&bulk_reduce_barriers[0]), bulk_reduce_phase);
+                            warpgroup_sync();
+                            bulk_reduce_phase ^= 1;
 
-//                         constexpr uint32_t on_chip_copy_bytes = reduction_size * sizeof(OutDtype);
-//                         __shared__ __align__(128) OutDtype tmp_shmem_epilogue[reduction_size];
+                            constexpr uint32_t reduce_halves = BM * BN;
+                            float4* reduce_dst4 = reinterpret_cast<float4*>(&shmem_epilogue[0]);
+                            const float4* staging_src4 = reinterpret_cast<const float4*>(splitk_staging);
 
-//                         int epilogue_readable_phase = 0;
-
-//                         for (int r = 1; r < split_k; ++r) {
-//                             const OutDtype* dst_shmem_epilogue = dst[r];
-
-//                             if (threadIdx.x == 0) {
-//
-//                                 nvgpu::arch::tma_expect_bytes(&epilogue_readable_barriers[0], on_chip_copy_bytes);
-//
-//                                 nv::arch::cluster_cp_async_bulk(
-//                                     tmp_shmem_epilogue, //  void* dst_local_smem,
-//                                     dst_shmem_epilogue, //  const void* src_remote_smem,
-//                                     on_chip_copy_bytes,
-//                                     &epilogue_readable_barriers[0]);
-//                             }
-
-//                             if (threadIdx.x == 0) {
-//                                 nvgpu::arch::tma_wait(__cvta_generic_to_shared(&epilogue_readable_barriers[0]), epilogue_readable_phase);
-//                             }
-//                             warpgroup_sync();
-
-//                             // flip again
-//                             epilogue_readable_phase ^= 1;
-
-//                             // NOTE (yiakwy) : perform on-chip reduction with NVIDIA SIMD add instruciton
-// #define VEC_SIZE 4
-//                             float4* local_dst_f4 = reinterpret_cast<float4*>(&shmem_epilogue[0]);
-//                             const float4* local_src_f4 = reinterpret_cast<const float4*>(tmp_shmem_epilogue);
-
-//                             constexpr int iterations = (reduction_size * sizeof(OutDtype)) / (4*VEC_SIZE); // 4xfp32
-
-//                             #pragma unroll VEC_SIZE
-//                             for (int idx = tid; idx < iterations; idx += CONSUMER_THREADS) {
-//                                 float4 val_dst = local_dst[idx];
-//                                 float4 val_src = local_src[idx];
-
-//                                 // nv::arch::simd_vec_add(reinterpret_cast<half2*>(val_dst), reinterpret_cast<half2*>(val_src));
-
-//                                 val_dst.x += val_src.x;
-//                                 val_dst.y += val_src.y;
-//                                 val_dst.z += val_src.z;
-//                                 val_dst.w += val_src.w;
-
-//                                 local_dst[idx] = val_dst;
-//                             }
-
-//                             // deal with loop tails
-//                             if constexpr (reduction_size % VEC_SIZE != 0) {
-//                                 for (int idx = (iterations) * VEC_SIZE + tid; idx < reduction_size; idx += CONSUMER_THREADS) {
-//                                     shmem_epilogue[idx] += tmp_shmem_epilogue[idx];
-//                                 }
-//                             }
-//                         }
-
-//                         warpgroup_sync();
-
-                        for (int r = 1; r < split_k; ++r) {
-                            OutDtype* dst_shmem_epilogue = dst[r];
-                            for (int idx = tid; idx < BM * BN; idx += CONSUMER_THREADS) {
-                                shmem_epilogue[idx] += dst_shmem_epilogue[idx];
+                            #pragma unroll
+                            for (int idx = tid; idx < reduce_halves / 8; idx += CONSUMER_THREADS) {
+                                float4 vd = reduce_dst4[idx];
+                                float4 vs = staging_src4[idx];
+                                nvgpu::arch::simd_vadd(
+                                    reinterpret_cast<half2*>(&vd),
+                                    reinterpret_cast<const half2*>(&vs));
+                                reduce_dst4[idx] = vd;
                             }
+                            warpgroup_sync();
+                        } else
+#endif
+                        {
+                            // NOTE (yiakwy) : naive solution
+                            for (int r = 1; r < split_k; ++r) {
+                                OutDtype* dst_shmem_epilogue = dst[r];
+                                for (int idx = tid; idx < BM * BN; idx += CONSUMER_THREADS) {
+                                    shmem_epilogue[idx] += dst_shmem_epilogue[idx];
+                                }
+                            }
+                            warpgroup_sync();
                         }
-                        warpgroup_sync();
 
                         if (threadIdx.x == 0) {
                             for (int r = 1; r < split_k; ++r) {
