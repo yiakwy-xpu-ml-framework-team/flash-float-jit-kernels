@@ -36,7 +36,7 @@ namespace cg = cooperative_groups;
 
 #define USE_CLUSTER_MULTICAST 1
 
-#define USE_INPALCE_TRI_TRANSPOSE 1
+#define USE_INPALCE_TRI_TRANSPOSE 0
 
 namespace xpu {
 
@@ -69,7 +69,6 @@ struct HopperPersistentSplitKPipeline {
         // const int lane_id = threadIdx.x % WARP_SIZE;
         // const int warp_id = threadIdx.x / WARP_SIZE;
 
-        /*
         if (tid == 0) {
             {
                 uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(tma_desc_X);
@@ -90,7 +89,6 @@ struct HopperPersistentSplitKPipeline {
             }
         }
         __syncwarp();
-        */
 
 #if USE_CLUSTER_MULTICAST
         uint32_t cluster_rank;
@@ -122,6 +120,13 @@ struct HopperPersistentSplitKPipeline {
         constexpr int SCLAE_BLOCK_SIZE_K = 128;
         constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
+        //prepare for swizzle
+        constexpr int SWIZZLE_BYTES = 128;
+        constexpr int ELEMENTS_PER_PANEL = SWIZZLE_BYTES / sizeof(OutDtype);
+        
+        constexpr int PANELS_PER_ROW = BN / ELEMENTS_PER_PANEL;
+        constexpr uint32_t PANEL_BYTES = BM * ELEMENTS_PER_PANEL * sizeof(OutDtype);
+
         /*
         __shared__ __align__(128) float shmem_XS[BM * K_TILES_TOTAL];
         __shared__ __align__(128) float shmem_WS[K_TILES_TOTAL];
@@ -130,6 +135,9 @@ struct HopperPersistentSplitKPipeline {
         offset += sizeof(OutDtype) * BM * BN;
         auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
         auto* shmem_WS = reinterpret_cast<float*>(smem_buffer + offset + sizeof(fp32_t) * BM * K_TILES_TOTAL);
+
+        offset += sizeof(fp32_t) * (BM * K_TILES_TOTAL + K_TILES_TOTAL);
+        OutDtype* shmem_transpose = reinterpret_cast<OutDtype*>(smem_buffer + offset);
 
         // TODO (yiakwy) : init full barriers for TMA, in mult-stages pipeline, we combine writer and reader barrieres in the same stage into one
         __shared__ __align__(128) uint64_t barriers[STAGES];
@@ -298,7 +306,7 @@ struct HopperPersistentSplitKPipeline {
                 int g_row = block_idx_m * BM + s_row;
                 int g_col = (k_start + s_col) / shares_per_scale;
 
-                shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
+                shmem_XS[s_col * (BM + 1) + s_row] = scale_X[g_row * stride_xs_m + g_col];
             }
             __syncthreads();
 
@@ -369,8 +377,7 @@ struct HopperPersistentSplitKPipeline {
 
                 HopperWGMMAExecutor::commit_and_wait();
 
-                local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
-                accum.add_(local_step_accum);
+                accum.fma_scaled_(local_step_accum, &shmem_XS[0], &shmem_WS[0], k_tile - k_start);
                 __syncwarp();
 
                 read_stage = (read_stage + 1) % STAGES;
@@ -383,13 +390,13 @@ struct HopperPersistentSplitKPipeline {
             //   - first write data back to share memory for SPLIT-K reduction via NoC
             //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
 
-            // if (threadIdx.x == 0) {
-            //     nvgpu::arch::tma_store_wait();
-            // }
-            // __syncthreads();
+            if (threadIdx.x == 0) {
+                nvgpu::arch::tma_store_wait();
+            }
+            __syncthreads();
 
             accum.store(shmem_epilogue);
-            // asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
+            asm volatile ("fence.proxy.async.shared::cta;\n" ::: "memory");
             __syncthreads();
 
             // if (threadIdx.x == 0 && blockIdx.x == 1) {
@@ -404,9 +411,10 @@ struct HopperPersistentSplitKPipeline {
             // __syncthreads();
 
             auto cluster = cooperative_groups::this_cluster();
-            cluster.sync();
 
             if (split_k > 1) {
+                cluster.sync();
+
                 if (split_k_id == 0) {
                     if (threadIdx.x == 0) {
                         for (int r = 1; r < split_k; ++r) {
@@ -437,7 +445,7 @@ struct HopperPersistentSplitKPipeline {
                         " [%0, {%2, %3}], [%1];"
                         :
                         : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                        "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                          "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                         : "memory"
                     );
     #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
@@ -448,22 +456,23 @@ struct HopperPersistentSplitKPipeline {
                 // NOTE (yiakwy) :  transpose copy to upper right
                 if (block_idx_m > block_idx_n) {
 
-#if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
+#if USE_INPALCE_TRI_TRANSPOSE
                     if (threadIdx.x == 0) {
-                        // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
                         nvgpu::arch::tma_store_wait();
                     }
                     __syncthreads();
 
                     // NOTE (yiakwy) : inplace transpose
-                    frag_view._transpose();
+                    frag_view._transpose_opt();
 
                     if (threadIdx.x == 0) {
+
 #if SWIZZLE_64B_STORE
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
 #else
                         uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
 #endif // SWIZZLE_64B_STORE
+
                         uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_epilogue[0]));
 
 #if SWIZZLE_64B_STORE
@@ -472,7 +481,8 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                            "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                              "r"(block_idx_n * BN), "r"(block_idx_m * BM)
+                            : "memory"
                         );
 
                         const uint32_t smem_epilogue_addr_next = smem_epilogue_addr + 128;
@@ -482,7 +492,8 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr_next),
-                                "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
+                              "r"(block_idx_n * BN + 64), "r"(block_idx_m * BM)
+                            : "memory"
                         );
 #else
                         asm volatile (
@@ -490,24 +501,71 @@ struct HopperPersistentSplitKPipeline {
                             " [%0, {%2, %3}], [%1];"
                             :
                             : "l"(tma_o_addr), "r"(smem_epilogue_addr),
-                            "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                              "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                            : "memory"
                         );
 #endif // SWIZZLE_64B_STORE
-                        // asm volatile("cp.async.bulk.commit_group;");
+                        asm volatile("cp.async.bulk.commit_group;");
+
                     } // inplace copy
 
-                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                    // asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
 #else
-                    // TODO (yiakwy) : outplace transpose
-#error "Outplace transpose is not implemented yet, please enable USE_INPALCE_TRI_TRANSPOSE to use inplace transpose."
+
+                    frag_view.transpose(shmem_transpose);
+
+                    if (threadIdx.x == 0) {
+
+#if SWIZZLE_64B_STORE
+                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O_swizzle);
+#else
+                        uint64_t tma_o_addr = reinterpret_cast<uint64_t>(tma_desc_O);
+#endif // SWIZZLE_64B_STORE
+
+                        uint32_t smem_epilogue_addr  = static_cast<uint32_t>(__cvta_generic_to_shared(&shmem_transpose[0]));
+
+#if SWIZZLE_64B_STORE //support fp16 and fp32
+                        #pragma unroll
+                        for (int panel_idx = 0; panel_idx < PANELS_PER_ROW; ++panel_idx) {
+
+                            uint32_t smem_panel_addr = smem_epilogue_addr + panel_idx * PANEL_BYTES;
+
+                            asm volatile (
+                                "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                                " [%0, {%2, %3}], [%1];"
+                                :
+                                : "l"(tma_o_addr), "r"(smem_panel_addr),
+                                "r"(block_idx_m * BN + panel_idx * ELEMENTS_PER_PANEL), 
+                                "r"(block_idx_n * BM)
+                                : "memory"
+                            );
+                        }
+                        
+#else
+                        asm volatile (
+                            "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+                            " [%0, {%2, %3}], [%1];"
+                            :
+                            : "l"(tma_o_addr), "r"(smem_epilogue_addr),
+                              "r"(block_idx_m * BN), "r"(block_idx_n * BM)
+                            : "memory"
+                        );
+#endif // SWIZZLE_64B_STORE
+                        asm volatile("cp.async.bulk.commit_group;");
+
+                    } // outplace copy
+
 
 #endif // USE_INPALCE_TRI_TRANSPOSE
 
                 } // block_idx_m > block_idx_n
 
             } // split_id == 0
+
             cluster.sync();
+            // __syncthreads();
+
 #else
             for (int idx = threadIdx.x; idx < BM * BN; idx += threads_per_block) {
                 int local_m = idx / BN;
