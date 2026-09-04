@@ -1,5 +1,5 @@
 """
-kernel_agent.py : GPU JIT Kernel Harnessing Agent Orchestrator
+kernel_agent.py : GPU JIT Kernel Harnessing Agent Orchestrator (HAO)
 
 A Python-based remote GPU JIT (H800 sm90a/DgxSpark sm120a /MacStudio Metal GPU) Kernel Harnessing agent that coordinates with a headless opencode server
 with REST API to write, verify, and optimize CUDA/Hip/Metal/Triton kernels on Hopper and other platforms (coming soon).
@@ -46,6 +46,8 @@ logger = logging.getLogger("kernel_agent")
 # ---------------------------------------------------------------------------
 # H800 DGX SupperPod Constants
 # ---------------------------------------------------------------------------
+
+# see https://itso.hkust.edu.hk/services/academic-teaching-support/high-performance-computing/superpod/hardware-specs for inter node info
 
 H100_PEAK_TFLOPS_FP16 = 989.5
 H100_PEAK_BW_GBS = 3352.0
