@@ -21,6 +21,13 @@ from triton.experimental.gluon.language.nvidia.hopper import (
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
 
+USE_TVM_FFI = False
+
+tvm_ffi_modules = {
+    "XXT": None,
+}
+
+
 def is_hopper():
     if not torch.cuda.is_available():
         return False
@@ -250,7 +257,12 @@ def _pid_to_block(
     return batch_idx, m_idx, n_idx
 
 
-def XXT(A: torch.Tensor, out: torch.Tensor, use_gluon: bool = True):
+def XXT(
+    A: torch.Tensor,
+    out: torch.Tensor,
+    use_gluon: bool = True,
+    use_tvm_ffi: Optional[bool] = None,
+):
     """
     Launch Triton kernel to compute C = A @ A.T
     """
@@ -272,7 +284,7 @@ def XXT(A: torch.Tensor, out: torch.Tensor, use_gluon: bool = True):
         LOWER_UPPER=1,
     )
 
-    return gemm_op(A, out)
+    return gemm_op(A, out, use_tvm_ffi=use_tvm_ffi)
 
 
 @gluon.constexpr_function
@@ -527,6 +539,81 @@ def XXT_kernel(
         tma.store_wait(pendings=0)
 
 
+def _gluon_xxt_tvm_ffi(out, grid, kernel_kwargs, key):
+    import tvm_ffi
+
+    from jit_kernel.triton3_5.gluon.tvm_ffi_mod import (
+        flatten_tvm_ffi_args,
+        generate_tvm_ffi_source,
+    )
+
+    global tvm_ffi_modules
+
+    if (
+        tvm_ffi_modules["XXT"] is not None
+        and tvm_ffi_modules["XXT"].get(key, None) is not None
+    ):
+        module, kernel_name, compiled_kernel, launch_grid = tvm_ffi_modules["XXT"][
+            key
+        ]
+    else:
+        compiled_kernel = XXT_kernel[grid](
+            kernel_kwargs["A_desc"],
+            kernel_kwargs["AT_desc"],
+            kernel_kwargs["C_desc"],
+            kernel_kwargs["CT_desc"],
+            M=kernel_kwargs["M"],
+            K=kernel_kwargs["K"],
+            BLOCK_SIZE_M=kernel_kwargs["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=kernel_kwargs["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=kernel_kwargs["BLOCK_SIZE_K"],
+            GROUP_SIZE_M=kernel_kwargs["GROUP_SIZE_M"],
+            LOWER_UPPER=kernel_kwargs["LOWER_UPPER"],
+            STAGES=kernel_kwargs["STAGES"],
+            NUM_CUs=kernel_kwargs["NUM_CUs"],
+            num_warps=kernel_kwargs["num_warps"],
+            num_blocks_m=kernel_kwargs["num_blocks_m"],
+            num_triangular_blocks=kernel_kwargs["num_triangular_blocks"],
+            batch_size=kernel_kwargs["batch_size"],
+            _cache_plance_holder=kernel_kwargs["_cache_plance_holder"],
+        )
+        torch.cuda.synchronize()
+
+        cubin_bytes = compiled_kernel.kernel
+        kernel_name = compiled_kernel.name
+        sources, _constants = generate_tvm_ffi_source(compiled_kernel, kernel_name)
+
+        module = tvm_ffi.cpp.load_inline(
+            "triton3_5_gluon_xxt_loader",
+            cuda_sources=sources,
+            extra_ldflags=["-lcudart", "-lcuda"],
+            embed_cubin={"triton_cubin": cubin_bytes},
+        )
+
+        gx = int(grid[0])
+        gy = int(grid[1]) if len(grid) > 1 else 1
+        gz = int(grid[2]) if len(grid) > 2 else 1
+        launch_grid = (gx, gy, gz)
+
+        if tvm_ffi_modules["XXT"] is None:
+            tvm_ffi_modules["XXT"] = {}
+
+        tvm_ffi_modules["XXT"][key] = (
+            module,
+            kernel_name,
+            compiled_kernel,
+            launch_grid,
+        )
+
+    ffi_args = flatten_tvm_ffi_args(
+        compiled_kernel,
+        kernel_kwargs,
+        launch_grid,
+    )
+    getattr(module, kernel_name)(*ffi_args)
+    return out
+
+
 class GluonXXT:
     def __init__(
         self,
@@ -552,21 +639,22 @@ class GluonXXT:
 
         self.NUM_CUs = 132
 
-    # TODO (yiakwy) : cache TVM-FFI compiled result
-
     def __call__(
         self,
         A: torch.Tensor,
         out: Optional[torch.Tensor] = None,
+        use_tvm_ffi: Optional[bool] = None,
     ) -> torch.Tensor:
         M, K = A.shape[-2:]
+
+        use_ffi = USE_TVM_FFI if use_tvm_ffi is None else use_tvm_ffi
 
         if out is None:
             if A.ndim == 2:
                 out = torch.empty((M, M), device=A.device, dtype=A.dtype)
             else:
                 out = torch.empty(A.shape[:-2] + (M, M), device=A.device, dtype=A.dtype)
-            cache_mode = 1
+            cache_mode = 0 if use_ffi else 1
         else:
             cache_mode = 0
 
@@ -592,6 +680,56 @@ class GluonXXT:
         grid_size = min(self.NUM_CUs, batch_size * num_triangular_blocks)
 
         grid = (grid_size,)
+
+        kernel_kwargs = {
+            "A_desc": A_desc,
+            "AT_desc": AT_desc,
+            "C_desc": C_desc,
+            "CT_desc": CT_desc,
+            "M": M,
+            "K": K,
+            "BLOCK_SIZE_M": self.BLOCK_SIZE_M,
+            "BLOCK_SIZE_N": self.BLOCK_SIZE_N,
+            "BLOCK_SIZE_K": self.BLOCK_SIZE_K,
+            "GROUP_SIZE_M": self.GROUP_SIZE_M,
+            "LOWER_UPPER": self.LOWER_UPPER,
+            "STAGES": self.STAGES,
+            "NUM_CUs": self.NUM_CUs,
+            "num_warps": self.NUM_WARPS,
+            "num_blocks_m": num_blocks_m,
+            "num_triangular_blocks": num_triangular_blocks,
+            "batch_size": batch_size,
+            "_cache_plance_holder": cache_mode,
+        }
+
+        if use_ffi:
+
+            def get_stable_kernel_key(M, K, **kwargs):
+                key_str = f"M{M}_K{K}_" + "_".join(
+                    f"{k}{v}" for k, v in sorted(kwargs.items())
+                )
+                return hashlib.md5(key_str.encode("utf-8")).hexdigest()
+
+            key = get_stable_kernel_key(
+                M,
+                K,
+                device=A.device,
+                input_dtype=A.dtype,
+                output_dtype=out.dtype,
+                input_shape=tuple(A.shape),
+                output_shape=tuple(out.shape),
+                input_stride=tuple(A.stride()),
+                output_stride=tuple(out.stride()),
+                BLOCK_SIZE_M=self.BLOCK_SIZE_M,
+                BLOCK_SIZE_N=self.BLOCK_SIZE_N,
+                BLOCK_SIZE_K=self.BLOCK_SIZE_K,
+                GROUP_SIZE_M=self.GROUP_SIZE_M,
+                LOWER_UPPER=self.LOWER_UPPER,
+                STAGES=self.STAGES,
+                NUM_CUs=self.NUM_CUs,
+                num_warps=self.NUM_WARPS,
+            )
+            return _gluon_xxt_tvm_ffi(out, grid, kernel_kwargs, key)
 
         XXT_kernel[grid](
             A_desc, AT_desc,
