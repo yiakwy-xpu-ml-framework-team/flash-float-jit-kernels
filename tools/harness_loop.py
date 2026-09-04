@@ -277,13 +277,13 @@ class HarnessLoop:
 
         prompt = (
             f"{context}\n\n"
-            "## Exploration phase (Plan Mode without edits)\nTask: {task}\n"
+            f"## Exploration phase (Plan Mode without edits)\nTask: {task}\n"
             "Profile this kernel (benchmark script, ncu if available, code reading) and "
             "produce an evidence-backed hypothesis LIST, worst first.\n"
-            "For each:\n" 
+            "For each:\n"
             "title, rationale (with numbers), and a probe_hint for the kernel-debug-probes skill. "
             "End with:\n"
-            'RESULT={"decision":"explore","time_us":null,'
+            'RESULT: {"decision":"explore","time_us":null,'
             '"hypotheses":[{"title":"...","rationale":"...","probe_hint":"..."}]}'
         )
         try:

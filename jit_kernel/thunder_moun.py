@@ -50,6 +50,7 @@ cuda_wasp_1p2c_impl_sources = [
     str(KERNEL_PATH / "csrc" / "thunder_moun/symm_1p2c_gemm.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/wasp_producer.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_gemm_scaled_impl.h"),
+    # str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_interleaved_gemm_scaled_impl.h"),
 ]
 
 cuda_multi_stage_impl_sources = [

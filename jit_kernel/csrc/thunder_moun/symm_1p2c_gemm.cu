@@ -62,7 +62,9 @@ namespace cg = cooperative_groups;
 #include "block/block.h"
 
 // TODO (yiakwy) : move to xpu general interface
+
 #include "block/nv_block_1p2c_gemm_scaled_impl.h"
+// #include "block/nv_block_1p2c_interleaved_gemm_scaled_impl.h"
 
 #include "arch/tma/tma_desc.h"
 
