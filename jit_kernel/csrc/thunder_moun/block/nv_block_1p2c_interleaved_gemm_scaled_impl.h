@@ -36,12 +36,12 @@ namespace cg = cooperative_groups;
 
 #define USE_CLUSTER_MULTICAST 1
 
-#define USE_INPALCE_TRI_TRANSPOSE 1
-
-// NOTE (yiakwy) : set to 1 to enable bulk-DMA reduction (cp.async.bulk.shared::cluster) via vectorized half2 (simd_vadd); toggle with FLASH_FLOAT_BULK_SPLITK=1
+// NOTE (yiakwy) : set to 1 to enable push mode bulk-DMA reduction (cp.async.bulk.shared::cluster.shared::cta) via vectorized half2 (simd_vadd); toggle with FLASH_FLOAT_BULK_SPLITK=1
 #ifndef USE_BULK_SPLITK_REDUCE
 #define USE_BULK_SPLITK_REDUCE 1
 #endif
+
+#define USE_INPALCE_TRI_TRANSPOSE 1
 
 #ifndef CONSUMER_THREADS
 #define CONSUMER_THREADS 256
@@ -206,7 +206,6 @@ struct HopperPersistentSplitKPipeline {
         // NOTE (yiakwy) : epilogue barrier for on chip split-k reduction
         __shared__ __align__(128) uint64_t epilogue_barriers[1];
         __shared__ __align__(128) uint64_t epilogue_readable_barriers[1];
-
 #if USE_BULK_SPLITK_REDUCE
         // NOTE (yiakwy) : completion barrier of the bulk copies in split-k reduction
         __shared__ __align__(128) uint64_t bulk_reduce_barriers[1];
@@ -367,7 +366,10 @@ struct HopperPersistentSplitKPipeline {
 #endif
 
             xpu::HopperWGMMAAccumulator<BM, BN, BK> accum;
-            xpu::HopperWGMMAAccumulator<BM, BN, BK> local_step_accum;
+
+            // NOTE (yiakwy) : keep WGMMA of k-tile k+1 on the tensor core while scale_add (FMA) of k-tile k on CUDA cores
+            xpu::HopperWGMMAAccumulator<BM, BN, BK> step_even;
+            xpu::HopperWGMMAAccumulator<BM, BN, BK> step_odd;
 
             __shared__ __align__(128) OutDtype *dst[8];
 
@@ -422,6 +424,7 @@ struct HopperPersistentSplitKPipeline {
 
                 // NOTE (yiakwy) : prefetch all scale without TMA
 
+#if !(defined(ABL_NO_SCALE_FFMA) && ABL_NO_SCALE_FFMA)
                 // TODO (yiakwy) : remap shmem_XS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
                 #pragma unroll 4
                 for (int i = tid; i < total_xs_elements; i += CONSUMER_THREADS) {
@@ -433,7 +436,6 @@ struct HopperPersistentSplitKPipeline {
 
                     shmem_XS[s_col * BM + s_row] = scale_X[g_row * stride_xs_m + g_col];
                 }
-                warpgroup_sync();
 
                 // TODO (yiakwy) : remap shmem_WS to per-thread registers to reduce the latency, since the scale load is on the critical path of the main loop.
                 #pragma unroll 4
@@ -445,44 +447,65 @@ struct HopperPersistentSplitKPipeline {
 
                     shmem_WS[s_col] = scale_W[g_row * stride_ws_n + g_col];
                 }
+#endif
                 warpgroup_sync();
 
-// #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-//                 if (threadIdx.x == 0 && blockIdx.x == 0) {
-//                     printf("[Consumer] [Prefetch] [Split#%d] [SM#%d] block#(%d, %d) enter into main loop ...\n", blockIdx.x, blockIdx.y, block_idx_m, block_idx_n);
-//                 }
-//                 warpgroup_sync();
-// #endif
-
                 // 2. main loop
-                for (int k_tile = k_start; k_tile < k_end; ++k_tile) {
+
+                // (0) issue the WGMMA of the first tile
+                if (k_start < k_end) {
                     uint32_t current_barrier = __cvta_generic_to_shared(&barriers[read_stage]);
 
-                    nvgpu::arch::tma_wait(current_barrier, tma_phase);
-
-#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-                    if (threadIdx.x == 0 && blockIdx.x == 0) {
-                        printf("[Consumer] [Split#%d/%d] [SM#%d] [tid#%d] block#(%d, %d) k_tile=%d, inputs are ready.\n", blockIdx.x, gridDim.x, blockIdx.y, tid, block_idx_m, block_idx_n, k_tile);
-                    }
-#endif
-
-                    local_step_accum.clear();
+                    nvgpu::arch::tma_wait(
+                        current_barrier, tma_phase);
 
                     uint32_t active_smem_x = __cvta_generic_to_shared(&shmem_X[read_stage]);
                     uint32_t active_smem_w = __cvta_generic_to_shared(&shmem_W[read_stage]);
 
-                    // NOTE (yiakwy) : hopper (SM90a) does not support mma_scaled instruction, sx, sw will be ignored in the current implementation, and the scaling will be applied in the epilogue.
-                    HopperWGMMAExecutor::mma_scaled(local_step_accum, active_smem_x, active_smem_w);
+                    HopperWGMMAExecutor::mma_scaled_interleaved_commit(step_even, active_smem_x, active_smem_w);
+                }
 
-                    HopperWGMMAExecutor::commit_and_wait();
+                for (int k_tile = k_start; k_tile < k_end; ++k_tile) {
+                    const bool has_next = (k_tile + 1 < k_end);
+                    const int k_off = k_tile - k_start;
 
+                    // (1) issue the WGMMA of the next tile
+                    if (has_next) {
+                        int next_stage = (read_stage + 1) % STAGES;
+                        const int next_phase = (next_stage == 0) ? (tma_phase ^ 1) : tma_phase;
+
+                        nvgpu::arch::tma_wait(
+                            __cvta_generic_to_shared(&barriers[next_stage]), next_phase);
+
+                        uint32_t active_smem_x = __cvta_generic_to_shared(&shmem_X[next_stage]);
+                        uint32_t active_smem_w = __cvta_generic_to_shared(&shmem_W[next_stage]);
+
+                        if ((k_off & 1) == 0) {
+                            // wgmma_batch_commit(step_odd,
+                            HopperWGMMAExecutor::mma_scaled_interleaved_commit(step_odd,
+                                active_smem_x,
+                                active_smem_w);
+                        } else {
+                            // wgmma_batch_commit(step_even,
+                            HopperWGMMAExecutor::mma_scaled_interleaved_commit(step_even,
+                                active_smem_x,
+                                active_smem_w);
+                        }
+                    }
+
+                    // (2) wait for completion of the current tile
+                    if (has_next) {
+                        asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+                    } else {
+                        asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+                    }
+
+                    // (3) notify the producer that the current tile's smem buffer is ready to be written
 #if USE_CLUSTER_MULTICAST
                     if (wg_lane_id < CLUSTER_SIZE_M) {
-                        uint32_t target_cta_rank = wg_lane_id;
-                        mbar_arrive_cluster_release(&empty_barriers[read_stage], target_cta_rank);
+                        mbar_arrive_cluster_release(&empty_barriers[read_stage], wg_lane_id);
                     }
 #else
-                    // TODO (yiakwy) : nvgpu::arch::arrive_barrier(empty_barriers[read_stage]);
                     if (threadIdx.x == 0) {
                         uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&empty_barriers[read_stage]));
                         asm volatile(
@@ -493,15 +516,22 @@ struct HopperPersistentSplitKPipeline {
                     }
 #endif
 
-#if defined(DEBUG_BLOCK) && DEBUG_BLOCK
-                    if (threadIdx.x == 0) {
-                        printf("[Consumer] [Split#%d] [SM#%d] [local_task_id#%d] [tid#%d] : Notified the producer that buffer#[%d] is ready to write.\n", blockIdx.x, blockIdx.y, local_task_id, tid, read_stage);
+                    // (4) fused scale + accumulate (FFMA) for this k-tile;
+#if defined(ABL_NO_SCALE_FFMA) && ABL_NO_SCALE_FFMA
+                    if ((k_off & 1) == 0) {
+                        accum.add_(step_even);
+                    } else {
+                        accum.add_(step_odd);
+                    }
+#else
+                    if ((k_off & 1) == 0) {
+                        xpu::HopperWGMMAAccumulator<BM, BN, BK>::scaled_add(accum, step_even,
+                            &shmem_XS[0], &shmem_WS[0], k_off);
+                    } else {
+                        xpu::HopperWGMMAAccumulator<BM, BN, BK>::scaled_add(accum, step_odd,
+                            &shmem_XS[0], &shmem_WS[0], k_off);
                     }
 #endif
-
-                    local_step_accum.mul_(&shmem_XS[0], &shmem_WS[0], k_tile - k_start);
-                    accum.add_(local_step_accum);
-                    warpgroup_sync();
 
                     read_stage = (read_stage + 1) % STAGES;
                     if (read_stage == 0) {
@@ -512,12 +542,15 @@ struct HopperPersistentSplitKPipeline {
                 // 3. Epilogue
                 //   - first write data back to share memory for SPLIT-K reduction via NoC
                 //   - applying successive operations upon tile results in the epilogue, such as bias add, activation, etc, can be fused in this step to save memory bandwidth.
+#if defined(ABL_NO_EPILOGUE) && ABL_NO_EPILOGUE
+                if (false) {
+#endif // ABL_NO_EPILOGUE
+
 #if defined(DEBUG_BLOCK) && DEBUG_BLOCK
                 if (threadIdx.x == 0 && blockIdx.x == 0) {
                     printf("[Epilogue] [Split#%d] [SM#%d] copying acc to shared memory...\n", blockIdx.x, blockIdx.y);
                 }
 #endif
-
                 if (threadIdx.x == 0) {
                     nvgpu::arch::tma_store_wait();
                 }
@@ -614,6 +647,7 @@ struct HopperPersistentSplitKPipeline {
                         } else
 #endif
                         {
+                            // NOTE (yiakwy) : naive solution
                             for (int r = 1; r < split_k; ++r) {
                                 OutDtype* dst_shmem_epilogue = dst[r];
                                 for (int idx = tid; idx < BM * BN; idx += CONSUMER_THREADS) {
@@ -793,6 +827,10 @@ struct HopperPersistentSplitKPipeline {
                 __syncwarp();
 
     #endif // __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+
+#if defined(ABL_NO_EPILOGUE) && ABL_NO_EPILOGUE
+                } // ABL_NO_EPILOGUE
+#endif // ABL_NO_EPILOGUE
 
                 // fetch next task
                 local_task_id += gridDim.y;
