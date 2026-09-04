@@ -1,25 +1,24 @@
 """
-kernel_agent.py — GPU Kernel Development Agent Orchestrator
+kernel_agent.py : GPU JIT Kernel Harnessing Agent Orchestrator
 
-A Python-based agent that coordinates with a headless opencode server
-(REST API) to write, verify, and optimize CUDA/Triton kernels on Hopper.
+A Python-based remote GPU JIT (H800 sm90a/DgxSpark sm120a /MacStudio Metal GPU) Kernel Harnessing agent that coordinates with a headless opencode server
+with REST API to write, verify, and optimize CUDA/Hip/Metal/Triton kernels on Hopper and other platforms (coming soon).
 
 Architecture:
-    kernel_agent.py  ──REST──►  opencode serve :8096
-                               (reads .opencode, uses skills, tool calls)
+    kernel_agent.py supports opencode serve RESTful API at port :8096 (reads .opencode, uses skills, tool calls)
 
     The agent drives:
     1. Session management  (create, prompt, abort)
-    2. Kernel write/modify  (via opencode agent)
-    3. Safety harness       (5-stage correctness verification)
-    4. Benchmark            (performance measurement)
-    5. Optimize loop        (write → verify → bench → keep/revert)
+    2. Kernel write/modify (via opencode agent)
+    3. Safety verify       (5-stage correctness verification)
+    4. Benchmark           (performance measurement)
+    5. Harness loop        (write → verify → bench → keep/revert)
 
 Usage:
     python tools/kernel_agent.py serve --port 8096
-    python tools/kernel_agent.py run --kernel jit_kernel/csrc/thunder_moun/symm_gemm.cu
-    python tools/kernel_agent.py harness --kernel tools/example_kernel.py
-    python tools/kernel_agent.py benchmark --kernel tools/example_kernel.py
+    python tools/kernel_agent.py harness --kernel jit_kernel/thunder_moun.py --approve-all --timeout-min 60
+    python tools/kernel_agent.py verify --kernel jit_kernel/thunder_moun.py
+    python tools/kernel_agent.py benchmark --kernel jit_kernel/thunder_moun.py
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 ROOT = pathlib.Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(ROOT))
@@ -45,14 +44,30 @@ logger = logging.getLogger("kernel_agent")
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# H800 DGX SupperPod Constants
 # ---------------------------------------------------------------------------
 
 H100_PEAK_TFLOPS_FP16 = 989.5
 H100_PEAK_BW_GBS = 3352.0
 DEFAULT_PORT = 8096
 DEFAULT_HOST = "0.0.0.0"
-SAFETY_SHAPES = [(128,), (512,), (2048,), (63,), (4097,), (1023,)]
+def _parse_int_list(env_name: str, default: list[tuple[int, ...]]) -> list[tuple[int, ...]]:
+    """Env override for harness shapes, comma-separated dims, e.g.
+    KERNEL_AGENT_SAFETY_SHAPES="128,256,2048" -> [(128,), (256,), (2048,)].
+    Useful while a known kernel bug (e.g. the small-shape wasp_1p2c hang at
+    nbm in {3,4,5} — see sandbox/probes/probe_hang_m384.py) blocks a stock shape."""
+    import os
+    raw = os.environ.get(env_name, "")
+    if not raw:
+        return default
+    try:
+        return [(int(tok.strip()),) for tok in raw.split(",") if tok.strip()]
+    except ValueError:
+        logger.warning("%s ignored (unparseable: %r)", env_name, raw)
+        return default
+
+SAFETY_SHAPES = _parse_int_list(
+    "KERNEL_AGENT_SAFETY_SHAPES", [(128,), (512,), (2048,), (63,), (4097,), (1023,)])
 SAFETY_VALUES = [0.0, 1e4, 1e-6]
 DETERMINISM_RUNS = 3
 
@@ -67,6 +82,7 @@ class HarnessResult:
     stage: str = ""
     detail: str = ""
     errors: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -98,6 +114,7 @@ class OperatorSpec:
     dtype: Any = None
     num_inputs: int = 2
     device: str = "auto"
+    alignment: Optional[int] = None
 
     def make_inputs(self, shape: tuple[int, ...], fill_val: Optional[float] = None) -> tuple:
         """Build inputs for ``shape``. ``fill_val`` gives a constant fill
@@ -157,7 +174,77 @@ def verify_correctness(spec: OperatorSpec, inputs: tuple) -> tuple[bool, str]:
     return True, ""
 
 
-def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
+def _verify_stage_worker(kernel_path: str, shape: tuple, fill_val, out_q) -> None:
+    """Subprocess worker for one harness stage. Builds its OWN spec + inputs in
+    the child (CUDA tensors cannot cross process boundaries) and reports back
+    (passed, detail). Killing this process on timeout is safe because its CUDA
+    context dies with it."""
+    try:
+        spec = load_operator_spec(kernel_path)
+        if spec is None:
+            out_q.put((False, "load", "cannot load kernel spec"))
+            return
+        inputs = spec.make_inputs(shape, fill_val=fill_val)
+        ok, msg = verify_correctness(spec, inputs)
+        out_q.put((ok, "", msg))
+    except Exception as exc:  # noqa: BLE001
+        out_q.put((False, "worker", f"{type(exc).__name__}: {exc}"))
+
+
+def run_stage_isolated(kernel_path: str, spec_for_skip: OperatorSpec,
+                       shape: tuple, fill_val=None,
+                       stage_timeout_s: float = 240.0) -> "tuple[bool, str]":
+    """Run one verification stage in a spawned subprocess with a hard timeout.
+
+    A hanging kernel (documented for small m in this repo: nbm in {3,4,5})
+    would otherwise freeze the whole harness loop. On timeout the stage fails
+    with a `stage_hang` detail so the orchestrator can react; the parent
+    records which shape to reproduce.
+    """
+    if shape and len(shape) == 1 and not all(d % (spec_for_skip.alignment or 1) == 0 for d in shape):
+        return True, ""  # skipped by alignment (spec already evaluated)
+
+    if not _torch_cuda_available():
+        # In-process fallback when there is no GPU (CI CPU-only environments).
+        inputs = spec_for_skip.make_inputs(shape, fill_val=fill_val)
+        return verify_correctness(spec_for_skip, inputs)
+
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    out_q = ctx.Queue()
+    proc = ctx.Process(target=_verify_stage_worker,
+                       args=(kernel_path, shape, fill_val, out_q),
+                       name=f"verify-stage-{shape}")
+    proc.start()
+    proc.join(stage_timeout_s)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+        return False, f"stage_hang: timed out after {stage_timeout_s:.0f}s (reproduce with this shape)"
+    try:
+        ok, tag, msg = out_q.get_nowait()
+    except Exception:
+        return False, f"stage crashed without report (exitcode={proc.exitcode})"
+    if not ok:
+        return False, msg or tag or "verification failed"
+    return True, ""
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def run_safety_verification(spec: OperatorSpec,
+                            *,
+                            kernel_path: Optional[str] = None,
+                            stage_timeout_s: float = 240.0) -> HarnessResult:
     """Run the 5-stage correctness harness on *spec*.
 
     Stages:
@@ -172,9 +259,24 @@ def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
     """
     import torch
 
+    def _shape_supported(shape: tuple[int, ...]) -> bool:
+        """A shape is supported when it respects the kernel's alignment (if any)."""
+        if not spec.alignment:
+            return True
+        return all(d % spec.alignment == 0 for d in shape)
+
     def _verify(shape: tuple[int, ...], fill_val: Optional[float] = None) -> tuple[bool, str]:
+        # Isolated subprocess with hard timeout when a kernel_path is given: a
+        # hanging kernel must fail its stage, never freeze the loop.
+        if kernel_path is not None:
+            if not _shape_supported(shape):
+                return True, ""  # handled as skip below
+            return run_stage_isolated(kernel_path, spec, shape, fill_val,
+                                      stage_timeout_s=stage_timeout_s)
         inputs = spec.make_inputs(shape, fill_val=fill_val)
         return verify_correctness(spec, inputs)
+
+    skipped: list[str] = []
 
     # Stage 1: Smoke
     ok, msg = _verify((128,))
@@ -183,6 +285,9 @@ def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
 
     # Stage 2: Shape sweep
     for shape in SAFETY_SHAPES:
+        if not _shape_supported(shape):
+            skipped.append(f"shape {shape} skipped (kernel requires {spec.alignment}-aligned dims)")
+            continue
         ok, msg = _verify(shape)
         if not ok:
             detail = f"shape {shape}: {msg}"
@@ -207,12 +312,15 @@ def run_safety_harness(spec: OperatorSpec) -> HarnessResult:
 
     # Stage 5: Edge cases (non-power-of-2 / non-tile-aligned dims)
     for shape in [(1023,), (4097,), (1537,)]:
+        if not _shape_supported(shape):
+            skipped.append(f"shape {shape} skipped (kernel requires {spec.alignment}-aligned dims)")
+            continue
         ok, msg = _verify(shape)
         if not ok:
             detail = f"shape {shape}: {msg}"
             return HarnessResult(False, "edge_cases", detail, [detail])
 
-    return HarnessResult(True)
+    return HarnessResult(True, skipped=skipped)
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +377,19 @@ def benchmark_kernel(
     median_us, min_us, max_us = _do_bench(fn)
     ref_us, _, _ = _do_bench(ref_fn)
 
-    # Rough FLOPs/bytes for SOL reporting
-    n = inputs[0].numel()
-    flops = n  # element-wise: 1 FLOP per element
-    bytes_moved = n * inputs[0].element_size() * (len(inputs) + 1)
+    # Rough FLOPs/bytes for SOL reporting — GEMM-aware when the output is 2-D
+    # (flops = 2*M*N*K) and both operands share the contraction dim; otherwise
+    # falls back to element-wise (1 FLOP per element).
+    out = fn(*inputs)
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    in_bytes = sum(t.numel() * t.element_size() for t in inputs if isinstance(t, torch.Tensor))
+    out_bytes = out.numel() * out.element_size() if hasattr(out, "numel") else in_bytes
+    bytes_moved = in_bytes + out_bytes
+    if out.dim() == 2 and inputs[0].dim() == 2 and inputs[0].shape[-1] == inputs[1].shape[-1]:
+        flops = 2 * out.shape[0] * out.shape[1] * inputs[0].shape[-1]
+    else:
+        flops = inputs[0].numel()  # element-wise: 1 FLOP per element
 
     return BenchResult(
         time_us=median_us,
@@ -332,20 +449,27 @@ def find_testable_function(mod: Any):
 REF_FN_NAMES = ("ref_fn", "reference", "ref", "_ref", "_ref_torch_impl",
                 "_ref_torch_impl_ori", "torch_ref", "ref_torch")
 
+SHAPE_GEN_NAMES = ("shape_generator", "make_inputs", "gen_inputs", "input_generator")
+
 
 def load_operator_spec(
     path: pathlib.Path,
     *,
     ref_fn_name: Optional[str] = None,
-    atol: float = 1e-3,
-    rtol: float = 1e-3,
+    atol: Optional[float] = None,
+    rtol: Optional[float] = None,
     device: str = "auto",
 ) -> Optional[OperatorSpec]:
     """Build an ``OperatorSpec`` from a kernel module file.
 
-    Auto-discovers the callable under test and, if present, a ground-truth
-    reference function (names in ``REF_FN_NAMES`` or ``ref_fn_name``).
+    Auto-discovers the callable under test plus, when present:
+      * a ground-truth reference function (names in ``REF_FN_NAMES`` or ``ref_fn_name``),
+      * an input ``shape_generator`` (names in ``SHAPE_GEN_NAMES``) — required for
+        multi-argument operators such as GEMM, and
+      * ``ATOL`` / ``RTOL`` module constants for the comparison tolerances.
     """
+    import inspect
+
     path = pathlib.Path(path).resolve()
     if not path.exists():
         logger.error("kernel file not found: %s", path)
@@ -364,8 +488,41 @@ def load_operator_spec(
             ref_fn = getattr(mod, name)
             break
 
-    return OperatorSpec(name=path.stem, fn=fn, ref_fn=ref_fn,
-                        atol=atol, rtol=rtol, device=device)
+    shape_generator: Optional[Any] = None
+    for name in SHAPE_GEN_NAMES:
+        if hasattr(mod, name):
+            shape_generator = getattr(mod, name)
+            break
+
+    if atol is None:
+        atol = float(getattr(mod, "ATOL", 1e-3))
+    if rtol is None:
+        rtol = float(getattr(mod, "RTOL", 1e-3))
+
+    # Optional shape-alignment constraint (e.g. tiled kernels: ALIGNMENT = 128).
+    # The harness skips unaligned shapes instead of failing on them.
+    alignment = int(getattr(mod, "ALIGNMENT", 0)) or None
+
+    # Hint when the default generator can't feed the kernel signature
+    if shape_generator is None:
+        try:
+            required = [
+                p for p in inspect.signature(fn).parameters.values()
+                if p.default is inspect.Parameter.empty
+                and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            ]
+            if len(required) != 2:
+                logger.warning(
+                    "%s requires %d positional args (%s); the default generator only "
+                    "produces 2. Define a `shape_generator(shape, fill_val)` in the "
+                    "module to drive the harness.",
+                    path.name, len(required), ", ".join(p.name for p in required),
+                )
+        except (ValueError, TypeError):
+            pass
+
+    return OperatorSpec(name=path.stem, fn=fn, ref_fn=ref_fn, shape_generator=shape_generator,
+                        atol=atol, rtol=rtol, device=device, alignment=alignment)
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +530,7 @@ def load_operator_spec(
 # ---------------------------------------------------------------------------
 
 class KernelAgent:
-    """Orchestrates kernel development via the opencode REST API.
+    """Orchestrates kernel Harnessing via the opencode REST API.
 
     Lifecycle:
         1. start_server()     — launch ``opencode serve --port <port>``
@@ -388,6 +545,8 @@ class KernelAgent:
         port: int = DEFAULT_PORT,
         host: str = DEFAULT_HOST,
         project_dir: Optional[str] = None,
+        interactive_permissions: bool = False,
+        auto_approve_permissions: bool = False,
     ) -> None:
         self.port = port
         self.host = host
@@ -397,6 +556,9 @@ class KernelAgent:
         self._server_proc: Optional[subprocess.Popen] = None
         self._session_id: Optional[str] = None
         self._history: list[dict] = []
+        self.interactive_permissions = interactive_permissions
+        self.auto_approve_permissions = auto_approve_permissions
+        self._answered_permissions: set[str] = set()
 
     # -- server lifecycle ----------------------------------------------------
 
@@ -466,13 +628,77 @@ class KernelAgent:
     # -- prompting -----------------------------------------------------------
 
     def prompt(self, text: str, *, agent: Optional[str] = None, timeout_ms: int = 300_000) -> str:
-        """Send a prompt and wait for the reply. Returns the text."""
+        """Send a prompt and wait for the reply. Returns the text.
+
+        Permission requests (opencode ``action.action=ask``) are serviced while
+        waiting: interactively from the keyboard when ``interactive_permissions``
+        is on, or automatically ("once") when ``auto_approve_permissions`` is on.
+        With both off (headless, no TTY), a pending request stalls the loop until
+        the prompt timeout — prefer --approve-all for unattended runs.
+        """
         logger.info("prompting session %s (%d chars)", self.session_id, len(text))
+        hook: Optional[Callable[[], None]] = None
+        if self.auto_approve_permissions:
+            hook = self._service_permission_asks
+        elif self.interactive_permissions and sys.stdin.isatty():
+            hook = self._service_permission_asks
         reply = self.client.send_and_wait(
-            self.session_id, text, agent=agent, timeout_ms=timeout_ms
+            self.session_id, text, agent=agent, timeout_ms=timeout_ms, poll_hook=hook
         )
         self._history.append({"role": "user", "text": text, "reply_len": len(reply)})
         return reply
+
+    # -- interactive permission approval ----------------------------------
+
+    def _service_permission_asks(self) -> None:
+        """Service pending permission requests: auto-approve ("once") when
+        ``auto_approve_permissions`` is on, otherwise ask the operator."""
+        try:
+            pending = [
+                p for p in self.client.list_permissions()
+                if p.get("sessionID") == self._session_id
+            ]
+        except Exception:
+            return  # endpoint missing/erroring — keep polling as before
+        for req in pending:
+            pid = req.get("id")
+            if not pid or pid in self._answered_permissions:
+                continue
+            self._answered_permissions.add(pid)
+            reply = "once" if self.auto_approve_permissions else self._keyboard_approve(req)
+            try:
+                self.client.reply_permission(pid, reply)
+                logger.info("permission %s (%s): %s", pid, req.get("permission"), reply)
+            except Exception as exc:
+                logger.warning("reply_permission failed (%s): %s", pid, exc)
+
+    @staticmethod
+    def _keyboard_approve(req: dict) -> str:
+        """Render one permission request on the terminal and read y/a/n."""
+        kind = req.get("permission", "unknown")
+        patterns = req.get("patterns") or []
+        meta = req.get("metadata") or {}
+        detail = meta.get("command") or meta.get("filepath") or meta.get("url") or ""
+        print()
+        print("=" * 60)
+        print(f"  [PERMISSION REQUEST] {kind}")
+        if patterns:
+            print(f"  patterns : {patterns}")
+        if detail:
+            print(f"  detail   : {detail}")
+        print("=" * 60)
+        while True:
+            try:
+                ans = input("Approve? [y]=once  [a]=always  [n]=reject > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return "reject"
+            if ans in ("", "y", "yes"):
+                return "once"
+            if ans in ("a", "always"):
+                return "always"
+            if ans in ("n", "no", "reject"):
+                return "reject"
 
     def command(self, cmd: str, args: str = "", *, agent: Optional[str] = None, timeout_ms: int = 600_000) -> str:
         """Execute a registered slash command (e.g. ``/kernel-opt``) and return
@@ -489,9 +715,15 @@ class KernelAgent:
 
     # -- kernel-specific operations ------------------------------------------
 
-    def write_kernel(self, task: str, *, agent: str = "kernel-dev") -> str:
-        """Ask opencode to write/modify a kernel. Returns the reply text."""
-        return self.prompt(task, agent=agent)
+    def write_kernel(self, task: str, *, agent: str = "kernel-dev",
+                     timeout_ms: int = 1_800_000) -> str:
+        """Ask opencode to write/modify a kernel. Returns the reply text.
+
+        ``kernel-dev`` runs as a multi-step subagent (read → edit → nvcc
+        compile → benchmark), so a single iteration regularly takes 5-20
+        minutes; the 30-minute default avoids premature client timeouts.
+        """
+        return self.prompt(task, agent=agent, timeout_ms=timeout_ms)
 
     def revert_last(self) -> bool:
         """Revert the last message in the session."""
@@ -505,6 +737,41 @@ class KernelAgent:
             return self.client.revert_message(self.session_id, msg_id)
         return False
 
+    # -- file snapshot / restore (robust alternative to revert_last) ---------
+
+    _SNAPSHOT_DIRS = ("jit_kernel", "benchmark")
+
+    def snapshot_tree(self, tag: str) -> Optional[pathlib.Path]:
+        """Tar the kernel source trees so a failed iteration can be restored
+        deterministically (revert_last only undoes ONE session message while the
+        agent may have edited files across many). Returns the archive path."""
+        import tarfile
+
+        base = ROOT / "experiments" / "snapshots"
+        base.mkdir(parents=True, exist_ok=True)
+        arc = base / f"{tag}.tar.gz"
+        with tarfile.open(arc, "w:gz") as tar:
+            for d in self._SNAPSHOT_DIRS:
+                path = ROOT / d
+                if path.exists():
+                    tar.add(path, arcname=d)
+        return arc
+
+    def restore_tree(self, tag: str) -> bool:
+        """Restore the source trees from a snapshot taken by ``snapshot_tree``."""
+        import tarfile
+
+        arc = ROOT / "experiments" / "snapshots" / f"{tag}.tar.gz"
+        if not arc.exists():
+            logger.warning("no snapshot %s to restore", arc)
+            return False
+        with tarfile.open(arc, "r:gz") as tar:
+            # Only extract over our own tree members; never follow absolute paths.
+            members = [m for m in tar.getmembers() if m.name.split("/")[0] in self._SNAPSHOT_DIRS]
+            tar.extractall(ROOT, members=members)
+        logger.info("restored snapshot %s", arc.name)
+        return True
+
     # -- safety harness (local, no opencode needed) --------------------------
 
     def check_kernel(self, kernel_path: str, num_inputs: int = 2) -> HarnessResult:
@@ -513,14 +780,12 @@ class KernelAgent:
         if spec is None:
             return HarnessResult(False, "load", f"cannot load kernel spec: {kernel_path}")
         spec.num_inputs = num_inputs
-        return run_safety_harness(spec)
+        return run_safety_verification(spec, kernel_path=kernel_path)
 
     # -- benchmark (local) ---------------------------------------------------
 
     def bench_kernel(self, kernel_path: str, n: int = 4096) -> BenchResult | None:
         """Benchmark a local kernel file against its reference (if any)."""
-        import torch
-
         spec = load_operator_spec(kernel_path)
         if spec is None:
             logger.error("cannot load kernel spec: %s", kernel_path)
@@ -531,6 +796,66 @@ class KernelAgent:
 
     # -- optimization loop ---------------------------------------------------
 
+    def _build_context_block(self, kernel_path: str, baseline: Optional[BenchResult],
+                             baseline_sol: Optional[dict]) -> str:
+        """Repo + baseline scaffolding injected into EVERY iteration prompt.
+
+        Without it the agent burns its budget rediscovering the file map, the
+        baseline numbers and the verification command every round (the #1 cause
+        of "no effective changes + timeout").
+        """
+        lines = [
+            "## Environment (fixed for all iterations)",
+            f"- Kernel under test: `{kernel_path}` (repo root = cwd)",
+            "- Verification command (run before claiming ANY improvement):",
+            f"  `python tools/kernel_agent.py verify --kernel {kernel_path}`",
+            "- Benchmark scripts live under `benchmark/` (see the one matching this op).",
+            "- Debugging methodology: follow the `kernel-debug-probes` skill — write a",
+            "  minimal standalone probe under `sandbox/probes/probe_<conjecture>.py` to",
+            "  isolate ONE hypothesis BEFORE re-editing the kernel; keep the probe.",
+            "- Change exactly ONE thing per iteration; end your reply with a line:",
+            '  `RESULT: {"decision":"keep|revert","time_us":<float>,"files":[...],"probes":[...],"next_hypothesis":"..."}`',
+        ]
+        if baseline is not None and baseline_sol is not None:
+            lines.append(
+                f"- Baseline: {baseline.time_us:.1f} us | SOL {baseline_sol['t_sol_us']:.1f} us "
+                f"| gap {baseline_sol['sol_gap']:.2f}x ({baseline_sol['classification']})"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_outcome_block(last_result: Optional[dict]) -> str:
+        """Feed the PREVIOUS iteration outcome back to the agent.
+
+        This is the feedback half of the loop: without it the agent never learns
+        why its last change was rejected and keeps proposing ineffective edits.
+        """
+        if not last_result:
+            return ""
+        phase = last_result.get("phase", "")
+        lines = ["\n## Previous iteration outcome"]
+        if phase == "harness":
+            lines += [
+                f"- **Verification FAILED** at stage `{last_result.get('stage')}`:",
+                f"  `{last_result.get('detail')}`",
+                "- Files were restored to the last good state. Diagnose with a probe",
+                "  (kernel-debug-probes skill) BEFORE editing again.",
+            ]
+        elif phase == "revert":
+            lines += [
+                f"- Kept-out: new time {last_result.get('time_us', float('nan')):.1f} us did NOT beat"
+                f" best {last_result.get('best_us', float('nan')):.1f} us. Files restored.",
+                "- Pick a DIFFERENT hypothesis; consider a profiling probe first.",
+            ]
+        elif phase == "keep":
+            lines.append(f"- KEEPED: {last_result.get('speedup_pct', 0):.1f}% faster.")
+        elif phase == "prompt":
+            lines += [
+                f"- **Prompt failed**: {last_result.get('error', '')[:300]}",
+                "- Work only on the single highest-value step; avoid long tool chains.",
+            ]
+        return "\n".join(lines)
+
     def optimize_loop(
         self,
         kernel_path: str,
@@ -538,6 +863,7 @@ class KernelAgent:
         *,
         max_iterations: int = 5,
         agent: str = "kernel-dev",
+        prompt_timeout_ms: int = 1_800_000,
     ) -> list[dict]:
         """Run the full optimization loop.
 
@@ -545,7 +871,9 @@ class KernelAgent:
         1. Ask opencode to optimize the kernel
         2. Run safety harness locally
         3. Benchmark locally
-        4. Keep if faster + correct, revert otherwise
+        4. Keep if faster + correct, restore snapshot otherwise
+        Every prompt carries (a) fixed environment context and (b) the previous
+        iteration's outcome, so failures actually reach the agent.
         """
         results: list[dict] = []
         best_time_us: Optional[float] = None
@@ -553,31 +881,82 @@ class KernelAgent:
         # Baseline benchmark
         logger.info("=== Baseline measurement ===")
         base_result = self.bench_kernel(kernel_path)
+        baseline_sol = None
         if base_result:
             best_time_us = base_result.time_us
-            sol = compute_sol_gap(base_result)
+            baseline_sol = compute_sol_gap(base_result)
             logger.info(
                 "baseline: %.1f us, SOL gap: %.1f×, %s",
-                sol["time_us"], sol["sol_gap"], sol["classification"],
+                baseline_sol["time_us"], baseline_sol["sol_gap"], baseline_sol["classification"],
             )
-            results.append({"iteration": 0, "phase": "baseline", **sol})
+            results.append({"iteration": 0, "phase": "baseline", **baseline_sol})
+
+        context_block = self._build_context_block(kernel_path, base_result, baseline_sol)
+        last_outcome: Optional[dict] = None
+        consecutive_conn_failures = 0
 
         for i in range(1, max_iterations + 1):
             logger.info("=== Iteration %d/%d ===", i, max_iterations)
 
-            # 1. Ask opencode to optimize
+            outcome_block = self._build_outcome_block(last_outcome)
+            best_txt = f"{best_time_us:.1f}" if best_time_us else "?"
             iteration_task = (
-                f"{task}\n\n"
-                f"Iteration {i}/{max_iterations}. "
-                f"Current best: {best_time_us:.1f} us" if best_time_us else task
+                f"{context_block}\n"
+                f"{outcome_block}\n\n"
+                f"## Task\n{task}\n\n"
+                f"Iteration {i}/{max_iterations}. Current best: {best_txt} us."
             )
+
+            tag = f"iter_{i}_pre"
+            self.snapshot_tree(tag)
+
             try:
-                reply = self.write_kernel(iteration_task, agent=agent)
+                reply = self.write_kernel(iteration_task, agent=agent,
+                                          timeout_ms=prompt_timeout_ms)
                 logger.info("agent reply (%d chars): %s", len(reply), reply[:200])
+                consecutive_conn_failures = 0
+            except TimeoutError as exc:
+                # Capture whatever the agent produced so far and feed it forward.
+                partial = ""
+                try:
+                    msgs = self.client.list_messages(self._session_id)
+                    found = self.client._find_reply(msgs)
+                    if found:
+                        partial = self.client._extract_text(found)[:2000]
+                except Exception:
+                    pass
+                logger.error("agent prompt timed out after %d ms; partial reply %d chars",
+                             prompt_timeout_ms, len(partial))
+                results.append({"iteration": i, "phase": "prompt",
+                                "error": str(exc), "partial_reply": partial})
+                last_outcome = {"phase": "prompt", "error": f"timeout; partial: {partial[-400:]}"}
+                # The agent may still be running server-side — abort so the next
+                # prompt does not collide, but do NOT assume the server died.
+                try:
+                    self.client.abort_session(self._session_id)
+                except Exception:
+                    pass
+                continue
             except Exception as exc:
                 logger.error("agent prompt failed: %s", exc)
                 results.append({"iteration": i, "phase": "prompt", "error": str(exc)})
-                continue
+                last_outcome = {"phase": "prompt", "error": str(exc)}
+                # Distinguish dead-server from transient errors; restart once.
+                if not self.client.ping():
+                    consecutive_conn_failures += 1
+                    logger.warning("opencode server unreachable (fail #%d) — restarting",
+                                   consecutive_conn_failures)
+                    self.start_server()
+                    if not self.wait_for_server():
+                        logger.error("server still down; stopping loop")
+                        break
+                    continue
+                else:
+                    try:
+                        self.client.abort_session(self._session_id)
+                    except Exception:
+                        pass
+                    continue
 
             # 2. Safety harness
             harness = self.check_kernel(kernel_path)
@@ -587,15 +966,20 @@ class KernelAgent:
                     "iteration": i, "phase": "harness",
                     "passed": False, "stage": harness.stage, "detail": harness.detail,
                 })
-                # Revert the bad edit
-                self.revert_last()
+                # Restore the last-good sources (deterministic; revert_last only
+                # undoes a single session message).
+                self.restore_tree(tag)
+                last_outcome = {"phase": "harness", "stage": harness.stage,
+                                "detail": harness.detail}
                 continue
 
             # 3. Benchmark
             bench = self.bench_kernel(kernel_path)
             if bench is None:
                 results.append({"iteration": i, "phase": "bench", "error": "benchmark failed"})
-                self.revert_last()
+                self.restore_tree(tag)
+                last_outcome = {"phase": "harness", "stage": "bench",
+                                "detail": "benchmark crashed"}
                 continue
 
             sol = compute_sol_gap(bench)
@@ -604,18 +988,22 @@ class KernelAgent:
                 i, sol["time_us"], sol["sol_gap"],
             )
 
-            # 4. Keep or revert
+            # 4. Keep or restore
             if best_time_us is not None and sol["time_us"] < best_time_us * 0.98:
                 # Faster — keep
                 speedup = (1 - sol["time_us"] / best_time_us) * 100
                 logger.info("KEEP — %.1f%% faster", speedup)
                 best_time_us = sol["time_us"]
                 results.append({"iteration": i, "phase": "keep", "speedup_pct": speedup, **sol})
+                last_outcome = {"phase": "keep", "speedup_pct": speedup}
             else:
-                # No improvement — revert
+                # No improvement — restore
                 logger.info("REVERT — no improvement (%.1f us vs %.1f us)", sol["time_us"], best_time_us or 0)
-                self.revert_last()
-                results.append({"iteration": i, "phase": "revert", **sol})
+                self.restore_tree(tag)
+                results.append({"iteration": i, "phase": "revert",
+                                **sol, "best_us": best_time_us or 0})
+                last_outcome = {"phase": "revert", "time_us": sol["time_us"],
+                                "best_us": best_time_us or 0}
 
         logger.info("=== Optimization complete. Best: %.1f us ===", best_time_us or 0)
         return results
@@ -659,6 +1047,12 @@ def build_harness_report(
         lines.append("|-------|--------|")
         for s in ("smoke", "shape_sweep", "stability", "determinism", "edge_cases"):
             lines.append(f"| {s} | pass |")
+        if result.skipped:
+            lines.append("")
+            lines.append("### Skipped (kernel alignment constraint)")
+            lines.append("")
+            for e in result.skipped:
+                lines.append(f"- {e}")
     else:
         lines.append(f"Failed at **{result.stage}**: `{result.detail}`")
         lines.append("")
@@ -697,7 +1091,7 @@ def build_harness_report(
     return "\n".join(lines)
 
 
-def run_harness_standalone(
+def run_safety_verification_standalone(
     kernel_path: str,
     *,
     n: int = 4096,
@@ -708,7 +1102,7 @@ def run_harness_standalone(
 
     Flow:
         1. Load operator spec (kernel fn + optional reference fn)
-        2. Run the 5-stage correctness harness (reference-verified)
+        2. Run the 5-stage correctness verification (reference-verified)
         3. If correctness passes, benchmark with triton.testing.do_bench
         4. Persist the report to ``harness_<kernel_name>.md``
     """
@@ -723,7 +1117,7 @@ def run_harness_standalone(
     print(f"  File:      {kernel_path}")
     print(f"  Reference: {spec.ref_fn.__name__ if spec.ref_fn else '(none — crash-only)'}")
 
-    result = run_safety_harness(spec)
+    result = run_safety_verification(spec, kernel_path=kernel_path)
 
     print(f"  Passed:  {result.passed}")
     if not result.passed:
@@ -735,6 +1129,10 @@ def run_harness_standalone(
                 print(f"    - {e}")
     else:
         print("  All 5 stages passed.")
+        if result.skipped:
+            print(f"  Skipped: {len(result.skipped)} (kernel alignment constraint)")
+            for e in result.skipped:
+                print(f"    - {e}")
 
     bench: Optional[BenchResult] = None
     sol: Optional[dict] = None
@@ -800,7 +1198,7 @@ def run_benchmark_standalone(kernel_path: str, n: int = 4096, device: str = "aut
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="GPU Kernel Development Agent Orchestrator",
+        description="GPU Kernel Harnessing Agent Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -812,17 +1210,50 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default=DEFAULT_HOST)
 
     # run (optimize loop)
-    p_run = sub.add_parser("run", help="Run the full optimization loop")
+    p_run = sub.add_parser("harness", help="Run the full optimization loop")
     p_run.add_argument("--kernel", required=True, help="Path to kernel file")
-    p_run.add_argument("--task", default="Optimize this kernel for better performance on Hopper.",
-                       help="Task description for the agent")
+    p_run.add_argument(
+        "--task",
+        default=(
+            "Improve the kernel's performance on H800 (sm90a). "
+            "Pick ONE bottleneck hypothesis per iteration; if correctness failed "
+            "last round, first isolate it with a minimal probe under sandbox/probes/ "
+            "(kernel-debug-probes skill) instead of re-editing blindly. Verify with "
+            "the verification command above before reporting."
+        ),
+        help="Task description for the agent (environment/baseline/outcome context "
+             "is injected automatically around it)",
+    )
     p_run.add_argument("--max-iter", type=int, default=5, help="Max optimization iterations")
+    p_run.add_argument("--timeout-min", type=float, default=45.0,
+                       help="Per-iteration prompt timeout in minutes (default: 45; "
+                            "subagent edits+compiles+benches kernels, keep it generous)")
+    p_run.add_argument("--no-approve", action="store_true",
+                       help="Disable keyboard approval of opencode permission requests")
+    p_run.add_argument("--approve-all", action="store_true",
+                       help="Auto-approve every permission request (recommended for "
+                            "unattended/headless runs; avoids stalls until timeout)")
     p_run.add_argument("--port", type=int, default=DEFAULT_PORT)
     p_run.add_argument("--host", default=DEFAULT_HOST)
     p_run.add_argument("--agent", default="kernel-dev", help="opencode agent name")
+    # v2 loop knobs (tools/harness_loop.py)
+    p_run.add_argument("--candidates", type=int, default=1,
+                       help="Mutually exclusive optimization variants per iteration (default 1)")
+    p_run.add_argument("--explore", action="store_true",
+                       help="Two-phase: agent first profiles and returns an evidence-backed "
+                            "hypothesis list (RESULT.hypotheses) that seeds later candidates")
+    p_run.add_argument("--gap-near-sol-stop", type=float, default=1.1,
+                       help="Stop when SOL gap <= this (default 1.1 = within 10%)")
+    p_run.add_argument("--gap-structural", type=float, default=5.0,
+                       help="Above this SOL gap allow structural changes (keep threshold 8%)")
+    p_run.add_argument("--no-lint", action="store_true", help="Skip kernel_lint advisory checks")
+    p_run.add_argument("--no-probes", action="store_true",
+                       help="Skip running archived regression probes during verify")
+    p_run.add_argument("--loop", choices=["legacy", "v2"], default="v2",
+                       help="Harness loop implementation (default v2 pluggable)")
 
     # harness
-    p_harness = sub.add_parser("harness", help="Run safety harness on a kernel")
+    p_harness = sub.add_parser("verify", help="Run safety harness on a kernel")
     p_harness.add_argument("--kernel", required=True, help="Path to kernel file")
     p_harness.add_argument("-n", type=int, default=4096, help="Benchmark input size")
     p_harness.add_argument("--output-dir", default=None,
@@ -882,24 +1313,41 @@ def main() -> None:
         finally:
             agent.stop_server()
 
-    elif args.command == "run":
-        agent = KernelAgent(port=args.port, host=args.host)
+    elif args.command == "harness":
+        agent = KernelAgent(
+            port=args.port, host=args.host,
+            interactive_permissions=not args.no_approve and not args.approve_all,
+            auto_approve_permissions=args.approve_all,
+        )
         if not agent.wait_for_server():
             logger.error("cannot connect to opencode server at %s", agent.base_url)
             sys.exit(1)
         agent.create_session(title=f"kernel-opt:{pathlib.Path(args.kernel).name}")
-        results = agent.optimize_loop(
-            args.kernel, args.task,
-            max_iterations=args.max_iter, agent=args.agent,
+
+        from tools.harness_loop import HarnessLoop, LoopConfig
+
+        cfg = LoopConfig(
+            max_iterations=args.max_iter,
+            prompt_timeout_ms=int(args.timeout_min * 60_000),
+            agent=args.agent,
+            num_candidates=args.candidates,
+            explore_first=args.explore,
+            gap_structural=args.gap_structural,
+            gap_near_sol_stop=args.gap_near_sol_stop,
+            run_lint=not args.no_lint,
+            run_regression_probes=not args.no_probes,
         )
-        # Save results
+        loop = HarnessLoop(agent, args.kernel, cfg)
+        logger.info("loop hooks: %s (pluggable: register_hook)", list(loop.hooks))
+        results = loop.run(args.task)
+        # results persisted by report hook; also keep legacy write for compat
         out_path = ROOT / "experiments" / f"{pathlib.Path(args.kernel).stem}_results.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(results, indent=2))
         logger.info("results saved to %s", out_path)
 
-    elif args.command == "harness":
-        run_harness_standalone(args.kernel, n=args.n, output_dir=args.output_dir, device=args.device)
+    elif args.command == "verify":
+        run_safety_verification_standalone(args.kernel, n=args.n, output_dir=args.output_dir, device=args.device)
 
     elif args.command == "benchmark":
         run_benchmark_standalone(args.kernel, n=args.n, device=args.device)

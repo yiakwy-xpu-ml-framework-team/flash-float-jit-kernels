@@ -38,8 +38,10 @@ template: |
   - Stage 3: Stability (extreme / degenerate fill values)
   - Stage 4: Determinism (same input → identical output, 3 runs)
   - Stage 5: Edge cases (non-power-of-2 / non-tile-aligned dims)
-  - Run it: `python tools/kernel_agent.py harness --kernel <kernel.py>`
-  - ANY failure → revert and try again
+  - Run it: `python tools/kernel_agent.py verify --kernel <kernel.py>`
+  - ANY failure → restore files and try again — but FIRST isolate the failure
+    with a minimal probe (kernel-debug-probes skill): one hypothesis, one script
+    under `sandbox/probes/`. Blind re-edits are the #1 cause of timeouts.
 
   ## 6. BENCHMARK + report
   - After correctness PASSES, benchmark with `triton.testing.do_bench`

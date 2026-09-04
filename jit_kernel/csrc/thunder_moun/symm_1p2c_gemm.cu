@@ -62,7 +62,9 @@ namespace cg = cooperative_groups;
 #include "block/block.h"
 
 // TODO (yiakwy) : move to xpu general interface
+
 #include "block/nv_block_1p2c_gemm_scaled_impl.h"
+// #include "block/nv_block_1p2c_interleaved_gemm_scaled_impl.h"
 
 #include "arch/tma/tma_desc.h"
 
@@ -72,7 +74,11 @@ constexpr int K_BLOCK_K = 128;
 
 constexpr int K_BLOCK_N_SWIZZLE = 64;
 
+#ifdef ABL_STAGES
+constexpr int K_STAGES = ABL_STAGES;
+#else
 constexpr int K_STAGES = 4;
+#endif
 
 constexpr int MAX_SPLIT_K = 8;
 

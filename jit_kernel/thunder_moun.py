@@ -23,6 +23,8 @@ else:
 
 from jit_kernel.utils import KERNEL_PATH
 
+from jit_kernel.fp8_quantize import fp8_weight_block_wise_quant
+
 extra_ldflags = ["-lcudart", "-lcuda"]
 
 cuda_common_sources = [
@@ -48,6 +50,7 @@ cuda_wasp_1p2c_impl_sources = [
     str(KERNEL_PATH / "csrc" / "thunder_moun/symm_1p2c_gemm.cu"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/wasp_producer.h"),
     str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_gemm_scaled_impl.h"),
+    # str(KERNEL_PATH / "csrc" / "thunder_moun/block/nv_block_1p2c_interleaved_gemm_scaled_impl.h"),
 ]
 
 cuda_multi_stage_impl_sources = [
@@ -60,6 +63,12 @@ _CPP_ENTRY = "symmetric_gemm_fp8_block_scaled"
 _PY_SYMBOL = "symmetric_gemm_fp8_block_scaled"
 
 common_cuda_flags = ["-O2", "-std=c++17"]
+
+# NOTE (yiakwy) : FLASH_FLOAT_BULK_SPLITK=1 switches the on-chip split-K reduction
+USE_BULK_SPLITK = False
+if os.environ.get("FLASH_FLOAT_BULK_SPLITK", "0") == "1":
+    common_cuda_flags += ["-DUSE_BULK_SPLITK_REDUCE=1"]
+    USE_BULK_SPLITK = True
 
 
 if torch.cuda.is_available():
@@ -202,8 +211,8 @@ def symm_gemm_block_scaled(
 
     split_k = max(1, K // BLK_K)
 
-    # NOTE (yiakwy) : disable on chip split_k reduction via NoC for the moment
-    split_k = 1
+    if USE_BULK_SPLITK:
+        split_k = min(split_k, 4) # maximum 4 for split_k, and at least 2 for cluster multicast
 
     if out is None:
         out = torch.empty(
@@ -255,3 +264,77 @@ def symm_gemm_block_scaled(
         )
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Harness integration (tools/kernel_agent.py OperatorSpec)
+# ---------------------------------------------------------------------------
+# `shape_generator` + `reference` let the generic 5-stage harness drive this
+# GEMM. NOTE: the CUDA kernel is a *symmetric* GEMM (it only launches the
+# lower-triangle tiles of the (M-block x N-block) output grid), so the harness
+# feeds the valid symmetric regime: a single bf16 matrix ``a`` is block-wise
+# FP8-quantized (jit_kernel/fp8_quantize.py) into ``a_q`` + scale ``s``; the
+# same ``a_q`` is used for both xq and wq (M == N) and ``s`` is shared by both
+# operands. Ground truth is the *pre-quantization* bf16 matmul ``a @ a.T``,
+# so correctness includes the FP8 quantization error (not just accumulation).
+
+ATOL = 5e-2
+RTOL = 5e-2
+
+# The CUDA kernel tiles at BLK_K granularity (TMA box of 128 x 128), so all
+# dims must be BLK_K-aligned; the harness skips unaligned shapes.
+ALIGNMENT = BLK_K
+
+_HARNESS_SOURCE: Optional[torch.Tensor] = None
+
+
+def _blocks(size: int) -> int:
+    return (size + BLK_K - 1) // BLK_K
+
+
+def shape_generator(shape, fill_val=None):
+    """Build a *symmetric* FP8-quantized workload for ``symm_gemm_block_scaled``.
+
+    The generic harness passes 1-D shapes (element-wise convention); for this
+    GEMM a 1-D shape is read as a square tile (M = N = K). A 3-D shape is read
+    as (M, N, K) and requires M == N (symmetric kernel contract).
+
+    A bf16 source matrix is block-wise FP8-quantized (BLK_K x BLK_K blocks);
+    the pre-quantization source is recorded for the ground-truth ``reference``.
+    """
+    global _HARNESS_SOURCE
+
+    if len(shape) == 1:
+        M = N = K = int(shape[0])
+    elif len(shape) == 3:
+        M, N, K = (int(s) for s in shape)
+        assert M == N, f"symmetric GEMM requires M == N, got {M} != {N}"
+    else:
+        raise ValueError(f"unexpected shape {shape!r}: expected (N,) or (M, N, K)")
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    if fill_val is None:
+        a = torch.rand(M, K, device=dev, dtype=torch.float32).to(torch.bfloat16)
+    else:
+        a = torch.full((M, K), fill_val, device=dev, dtype=torch.bfloat16)
+
+    _HARNESS_SOURCE = a
+
+    # Block-wise FP8 quant: s is (m_blocks, k_blocks).
+    # scale_X is per row (M, k_blocks); scale_W is per N-block (m_blocks, k_blocks).
+    a_q, s = fp8_weight_block_wise_quant(a, BLK_K, BLK_K)
+    xs_lhs = s.repeat_interleave(BLK_K, dim=0)[:M]
+    return a_q, a_q, xs_lhs, s
+
+
+def reference(xq: torch.Tensor, wq: torch.Tensor, xs_lhs: torch.Tensor, xs_rhs: torch.Tensor):
+    """Ground truth: pre-quantization bf16 symmetric GEMM ``a @ a.T``.
+
+    The source matrix recorded by ``shape_generator`` is the bf16 data the FP8
+    quantization approximates, so this is the true target the kernel must match
+    (within FP8 quantization tolerance), not the FP8-dequantized recompute.
+    """
+    a = _HARNESS_SOURCE
+    if a is None:
+        raise ValueError("shape_generator must run before reference (records the pre-quantization source)")
+    return (a @ a.T).to(torch.float16)

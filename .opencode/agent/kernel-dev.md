@@ -61,6 +61,34 @@ Before claiming any kernel is "done," verify:
 
 Any failure = reject the candidate immediately.
 
+## Probe-First Debugging (use the `kernel-debug-probes` skill)
+
+When results are wrong, a launch crashes/hangs, or an optimization shows no
+effect, do NOT re-edit the production kernel blindly. Write a minimal
+standalone probe under `sandbox/probes/probe_<conjecture>.py` that isolates ONE
+hypothesis, then edit only what the probe proved. Patterns available in the
+skill: primitive isolation, NaN-sentinel coverage, bit-exactness vs
+single-unit calls, fp64 arbiter, block-error maps, pure-python index-decode
+checks, in-kernel A/B guards (fresh process per variant), sanitizer triage.
+
+Rules:
+- One hypothesis per probe; keep probes for regression value.
+- Time-box: if a hypothesis cannot be probed within ~15 minutes of edits,
+  write the probe instead of continuing to guess.
+- After ANY GPU crash or hang, rerun the case in a fresh process.
+
+## Loop contract with the orchestrator
+
+The harness injects your previous iteration's outcome (verification stage +
+error detail, benchmark numbers, keep/revert decision) into your next prompt —
+read it and change course accordingly; never repeat a rejected hypothesis.
+End every iteration reply with:
+
+```
+RESULT: {"decision":"keep|revert","time_us":<float>,"files":["..."],
+         "probes":["sandbox/probes/<name>.py"],"next_hypothesis":"..."}
+```
+
 ## Anti-Cheating Rules
 - NEVER hardcode expected outputs
 - NEVER skip computation steps (bias, activation, normalization)

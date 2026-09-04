@@ -16,7 +16,10 @@
       "mode": "subagent",
       "permission": {
         "edit": "allow",
-        "bash": "allow"
+        "bash": "allow",
+        "external_directory": {
+          "/tmp/opencode/*": "allow"
+        }
       }
     }
   },
