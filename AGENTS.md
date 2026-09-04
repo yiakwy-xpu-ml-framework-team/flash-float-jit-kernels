@@ -2,9 +2,11 @@
 
 ## Project Overview
 This repository is a high-performance JIT (Just-In-Time) GPU kernel library for low-latency LLM inference. It contains:
-- **CUDA kernels**: Ultra-low-latency TopK indexer (Distributed Radix Sort via NoC) and ThunderMuon symmetric GEMM
+- **CUDA kernels**: 
+  - Hopper (sm90a) : Ultra-low-latency TopK indexer (Distributed Radix Sort via NoC) / ThunderMuon symmetric GEMM (on chip Split-K Bulk Reduce) / Mega MoE / Mega NS5
+  - DGX-Spark (sm121a) : VeloxVoice NVFP4 GEMM / VeloxVoice Fused Mel Log 
 - **Triton kernels**: Symmetric GEMM via Triton 3.4
-- **Metal kernels**: Sub-1-bit StreamK GEMM for Apple Silicon (via mlx-lm PR #609)
+- **Metal kernels**: Sub-1-bit StreamK JIT XOR GEMM kernel for Apple Silicon, via our first attempt in mlx-lm [PR#609](https://github.com/ml-explore/mlx-lm/pull/609)
 - **Build system**: `torch.utils.cpp_extension.load` for JIT compilation, supporting CUDA (Hopper sm_90) and ROCm
 - **Agent system**: Headless opencode server + kernel_agent.py orchestrator for automated kernel development
 

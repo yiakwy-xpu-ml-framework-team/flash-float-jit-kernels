@@ -8,16 +8,20 @@
 3. **Fragment shape**：尝试不同的 Fragment shape 组合，用足更大算力（MFU）。
 
 硬约束：
-- **不要**把原来定义在 `fragment/` 里的东西挪出去。
-- **不要**重写与现有功能一致的实现——没有可量化加速的改写直接省略。
+- **不要** 把原来定义在 `arch/`, `block/`, `fragment/`, `tensor/`, 里的东西挪出去。
+- **不要** 重写与现有功能一致的实现, 没有可量化加速的改写直接省略。
 - 每次 edit 都必须带有明确的性能动机（approx SOL / bottleneck 分析），并保持
   `jit_kernel/thunder_moun.py` 与 `csrc/` 的现有接口不变。
 
-
+优化记录：
+- 优化的前形成 plan 记录为 md 文档，放在 `sandbox/probes` 下面，和计划修改文件，修改方向
+- 修改不要直接 edit 源文件，而先放在 `sandbox` 下形成方案，进行替换；将实验结果，按日期修改内容记录
+- 最后形成 ablation study，将有效的修改整合规约，进行集成测试
+- 只提交成功的优化，并同步到文静，并在 summary 文档记录最终的修改方案 和 内容
 
 ## Paper References
 
-### AutoKernel (2026) [1]
+### AutoKernel [^1]
 - **Core idea**: Automatic kernel optimization via CPU-first safety harness + keep/revert loop
 - **What we took**:
   - 5-stage correctness harness: smoke → shape sweep → stability → determinism → edge cases
@@ -25,7 +29,7 @@
   - Amdahl's Law prioritization for optimization candidates
 - **Usage in this repo**: `tools/kernel_agent.py` implements the full 5-stage harness
 
-### DRTriton (2026) [2]
+### DRTriton [^2]
 - **Core idea**: Curriculum RL for Triton kernel generation with CSP-DAG test synthesis
 - **What we took**:
   - Synthetic test generation via constraint satisfaction
@@ -33,13 +37,19 @@
   - Test-time kernel search with multiple candidates
 - **Usage in this repo**: Test generation patterns in benchmark scripts, shape sweep in safety harness
 
-### SOLAR (2026) [3]
+### SOLAR [^3]
 - **Core idea**: Speed-of-Light analysis for systematic kernel optimization
 - **What we took**:
   - SOL gap metric: `g = t_best / max(T_compute, T_mem)`
   - MANTIS optimization loop: Measure → Analyze → Nominate → Triage → Implement → Summarize
   - Compute-bound vs memory-bound classification
 - **Usage in this repo**: `.opencode/agent/kernel-dev.md` implements MANTIS loop
+
+### DeepSeek Harness
+- **Core idea**: Self-Envolv Agent
+- **Waht we took**:
+  - Defining kerenl-dev loop contract for runtime monkey patch
+  - 
 
 ---
 
@@ -242,4 +252,8 @@ Agent-Driven Search," arXiv:2603.21331, 2026.
 Learning for Triton Kernel Generation," arXiv:2603.21465, 2026.
 
 [3] S. K. S. Hari et al., "Improving EHiciency of GPU Kernel Optimization Agents using a DSL
-and Speed-of-Light Guidance," arXiv:2603.29010, 2026
+and Speed-of-Light Guidance," arXiv:2603.29010, 2026.
+
+[4] DeepSeek Harness : https://github.com/deepseek-ai/deepseek-harness. Accessed online on Sep 1st, 2026.
+
+[5] Yifan Shi, Wei Zhang, Tianyi Cui, "A Programming Paradigm for Spatiotemporal Composabilit", https://arxiv.org/pdf/2608.25512. Accessed online on Sep 1st, 2026.
