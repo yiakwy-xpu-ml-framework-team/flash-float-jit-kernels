@@ -448,7 +448,7 @@ configs = list(itertools.product(M, dummy))
 B = [1, 4, 16]
 BATCH_CONFIGS = list(itertools.product(M, B))
 
-BATCH_BENCH_CONFIGS = list(itertools.product([2048, 4096], [1, 4, 8, 16]))
+BATCH_BENCH_CONFIGS = list(itertools.product([2048, 4096, 8192], [1, 4, 8, 16]))
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
