@@ -75,5 +75,5 @@ See `.opencode/skills/hopper-kernel/SKILL.md` and `RESEARCH_NOTES.md` for detail
 ## Agent Workflow (Headless Mode)
 1. Start opencode server: `python tools/kernel_agent.py serve --port 8096`
 2. Create session: `python tools/kernel_agent.py session create`
-3. Run optimization: `python tools/kernel_agent.py run --kernel <path> --max-iter 5`
-4. Or standalone: `python tools/kernel_agent.py harness --kernel <path>`
+3. Run optimization: `python tools/kernel_agent.py harness --kernel <path> --max-iter 5`
+4. Or standalone: `python tools/kernel_agent.py verify --kernel <path>`

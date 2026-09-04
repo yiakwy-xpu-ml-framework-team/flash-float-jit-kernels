@@ -1,44 +1,43 @@
 # Research Notes: flash-float-jit-kernels
 
-## thunder_moun GEMM 优化方向偏好（人工指定的优先级）
+## thunder_moun GEMM Optimization Direction Human Preferences
 
-仅在以下三个方向上尝试优化，按优先级排序：
-1. **on-chip split-k all-reduce**：降低跨 block 归约（k-dim 归并）的开销。
-2. **inplace transpose**：优化 inplace transpose，并完善 output transpose 路径。
-3. **Fragment shape**：尝试不同的 Fragment shape 组合，用足更大算力（MFU）。
+Only optimize in the following three directions, prioritized as listed:
+1. **on-chip split-k all-reduce**：Reduce the overhead of cross-block reduction.
+2. **inplace transpose**：Optimize in-place transpose and improve the output transpose path.
+3. **Fragment shape**：Experiment with different fragment shape combinations to fully utilize greater compute capacity (MFU).
 
-硬约束：
-- **不要** 把原来定义在 `arch/`, `block/`, `fragment/`, `tensor/`, 里的东西挪出去。
-- **不要** 重写与现有功能一致的实现, 没有可量化加速的改写直接省略。
-- 每次 edit 都必须带有明确的性能动机（approx SOL / bottleneck 分析），并保持
-  `jit_kernel/thunder_moun.py` 与 `csrc/` 的现有接口不变。
+Hard Constraints:
+- **Don't** move anything originally defined in arch/, block/, fragment/, or tensor/ out of those directories.
+- **Don't** rewrite implementations that are functionally identical to existing ones; omit changes without quantifiable performance gains.
+- Every edit **must** be accompanied by a clear performance motivation (approx SOL / bottleneck analysis), and keep the existing interfaces of jit_kernel/thunder_moun.py and csrc/ unchanged.
 
-优化记录：
-- 优化的前形成 plan 记录为 md 文档，放在 `sandbox/probes` 下面，和计划修改文件，修改方向
-- 修改不要直接 edit 源文件，而先放在 `sandbox` 下形成方案，进行替换；将实验结果，按日期修改内容记录
-- 最后形成 ablation study，将有效的修改整合规约，进行集成测试
-- 只提交成功的优化，并同步到文静，并在 summary 文档记录最终的修改方案 和 内容
+Optimization Record Workflow:
+- Before optimization, formulate a plan as a markdown document, placed under sandbox/probes, including the files to be modified and the direction of modification.
+- Do not directly edit the source files. Instead, first place the proposed changes under sandbox to form a solution for replacement. Record experimental results and modification content by date.
+- Finally, compile an ablation study. Consolidate effective modifications, integrate them, and perform integration testing.
+- Only commit successful optimizations. Sync them to the documentation, and record the final modification plan and content in the summary document.
 
 ## Paper References
 
-### AutoKernel [^1]
-- **Core idea**: Automatic kernel optimization via CPU-first safety harness + keep/revert loop
+### AutoKernel
+- **Core idea**: Automatic kernel optimization via CPU-first safety harness + GPU-centric optimization + keep/revert loop [1]
 - **What we took**:
   - 5-stage correctness harness: smoke → shape sweep → stability → determinism → edge cases
   - Keep/revert optimization loop with consecutive-revert stopping
   - Amdahl's Law prioritization for optimization candidates
 - **Usage in this repo**: `tools/kernel_agent.py` implements the full 5-stage harness
 
-### DRTriton [^2]
-- **Core idea**: Curriculum RL for Triton kernel generation with CSP-DAG test synthesis
+### DRTriton
+- **Core idea**: Curriculum RL for Triton kernel generation with CSP-DAG test synthesis [2]
 - **What we took**:
   - Synthetic test generation via constraint satisfaction
   - Curriculum difficulty escalation (small shapes → large shapes → edge cases)
   - Test-time kernel search with multiple candidates
 - **Usage in this repo**: Test generation patterns in benchmark scripts, shape sweep in safety harness
 
-### SOLAR [^3]
-- **Core idea**: Speed-of-Light analysis for systematic kernel optimization
+### SOLAR
+- **Core idea**: Speed-of-Light analysis for systematic kernel optimization [3]
 - **What we took**:
   - SOL gap metric: `g = t_best / max(T_compute, T_mem)`
   - MANTIS optimization loop: Measure → Analyze → Nominate → Triage → Implement → Summarize
@@ -46,11 +45,10 @@
 - **Usage in this repo**: `.opencode/agent/kernel-dev.md` implements MANTIS loop
 
 ### DeepSeek Harness
-- **Core idea**: Self-Envolv Agent
+- **Core idea**: Self-Envolv Agent [4] [5]
 - **Waht we took**:
   - Defining kerenl-dev loop contract for runtime monkey patch
-  - 
-
+- **Usage in this repo**: `tools/harness_loop.py` to implement contracts
 ---
 
 ## Hopper Platform Coding Patterns

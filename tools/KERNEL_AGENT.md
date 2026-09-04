@@ -1,4 +1,4 @@
-# Internal Kernel Development Agent (KDA)
+# GPU JIT Kernel Harnessing Agent Orchestrator (HAO)
 
 A Python-based agent orchestrator that coordinates with a headless opencode
 server (REST API) to write, verify, and optimize CUDA/Triton kernels.
@@ -63,9 +63,9 @@ python tools/kernel_agent.py benchmark --kernel tools/example_kernel.py -n 4096
 python tools/kernel_agent.py serve --port 8096
 
 # Full optimization loop (in another terminal)
-python tools/kernel_agent.py run \
-    --kernel jit_kernel/csrc/thunder_moun/symm_gemm.cu \
-    --task "Optimize symm_gemm for better SOL gap on H100" \
+python tools/kernel_agent.py harness \
+    --kernel jit_kernel/thunder_moun.py \
+    --task "Optimize symm_gemm for better SOL gap on H800" \
     --max-iter 5 \
     --port 8096
 
@@ -122,6 +122,15 @@ for i in 1..max_iterations:
 
 ## Paper Connections
 
-- **AutoKernel**: 5-stage harness, keep/revert loop, consecutive revert stopping
-- **DRTriton**: CSP-DAG test generation, curriculum difficulty escalation
-- **SOLAR**: SOL gap analysis, MANTIS optimization loop, compute/memory classification
+[1] J. Jaber and O. Jaber, "AutoKernel: Autonomous GPU Kernel Optimization via Iterative
+Agent-Driven Search," arXiv:2603.21331, 2026.
+
+[2] S. Guo, M. Lin, and T. Yang, "DRTriton: Large-Scale Synthetic Data Driven Reinforcement
+Learning for Triton Kernel Generation," arXiv:2603.21465, 2026.
+
+[3] S. K. S. Hari et al., "Improving EHiciency of GPU Kernel Optimization Agents using a DSL
+and Speed-of-Light Guidance," arXiv:2603.29010, 2026.
+
+[4] DeepSeek Harness : https://github.com/deepseek-ai/deepseek-harness. Accessed online on Sep 1st, 2026.
+
+[5] Yifan Shi, Wei Zhang, Tianyi Cui, "A Programming Paradigm for Spatiotemporal Composabilit", https://arxiv.org/pdf/2608.25512. Accessed online on Sep 1st, 2026.
