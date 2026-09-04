@@ -97,6 +97,7 @@ static __device__ __forceinline__ void cluster_cp_async_bulk(
 
     uint32_t mbar_addr = __cvta_generic_to_shared(s_mbar);
 
+    // NOTE (yiakwy) : push only smem to smem bulk copy
     asm volatile(
         "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
         :: "r"(dst_addr), "r"(src_addr), "r"(bytes), "r"(mbar_addr)
@@ -360,7 +361,7 @@ struct HopperPersistentSplitKPipeline {
             auto* shmem_WS = reinterpret_cast<float*>(smem_buffer + offset + sizeof(fp32_t) * BM * K_TILES_TOTAL);
 
 #if USE_BULK_SPLITK_REDUCE
-            // NOTE (yiakwy) : bulk-DMA reduce staging buffer
+            // NOTE (yiakwy) : bulk-DMA reduce staging buffer. This region can be reused in epilogue.
             OutDtype* splitk_staging = reinterpret_cast<OutDtype*>(shmem_XS);
 #endif
 

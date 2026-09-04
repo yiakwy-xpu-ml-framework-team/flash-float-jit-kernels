@@ -16,7 +16,7 @@ Architecture:
 
 Usage:
     python tools/kernel_agent.py serve --port 8096
-    python tools/kernel_agent.py harness --kernel jit_kernel/thunder_moun.py
+    python tools/kernel_agent.py harness --kernel jit_kernel/thunder_moun.py --approve-all --timeout-min 60
     python tools/kernel_agent.py verify --kernel jit_kernel/thunder_moun.py
     python tools/kernel_agent.py benchmark --kernel jit_kernel/thunder_moun.py
 """
@@ -51,7 +51,23 @@ H100_PEAK_TFLOPS_FP16 = 989.5
 H100_PEAK_BW_GBS = 3352.0
 DEFAULT_PORT = 8096
 DEFAULT_HOST = "0.0.0.0"
-SAFETY_SHAPES = [(128,), (512,), (2048,), (63,), (4097,), (1023,)]
+def _parse_int_list(env_name: str, default: list[tuple[int, ...]]) -> list[tuple[int, ...]]:
+    """Env override for harness shapes, comma-separated dims, e.g.
+    KERNEL_AGENT_SAFETY_SHAPES="128,256,2048" -> [(128,), (256,), (2048,)].
+    Useful while a known kernel bug (e.g. the small-shape wasp_1p2c hang at
+    nbm in {3,4,5} — see sandbox/probes/probe_hang_m384.py) blocks a stock shape."""
+    import os
+    raw = os.environ.get(env_name, "")
+    if not raw:
+        return default
+    try:
+        return [(int(tok.strip()),) for tok in raw.split(",") if tok.strip()]
+    except ValueError:
+        logger.warning("%s ignored (unparseable: %r)", env_name, raw)
+        return default
+
+SAFETY_SHAPES = _parse_int_list(
+    "KERNEL_AGENT_SAFETY_SHAPES", [(128,), (512,), (2048,), (63,), (4097,), (1023,)])
 SAFETY_VALUES = [0.0, 1e4, 1e-6]
 DETERMINISM_RUNS = 3
 
@@ -158,7 +174,77 @@ def verify_correctness(spec: OperatorSpec, inputs: tuple) -> tuple[bool, str]:
     return True, ""
 
 
-def run_safety_verification(spec: OperatorSpec) -> HarnessResult:
+def _verify_stage_worker(kernel_path: str, shape: tuple, fill_val, out_q) -> None:
+    """Subprocess worker for one harness stage. Builds its OWN spec + inputs in
+    the child (CUDA tensors cannot cross process boundaries) and reports back
+    (passed, detail). Killing this process on timeout is safe because its CUDA
+    context dies with it."""
+    try:
+        spec = load_operator_spec(kernel_path)
+        if spec is None:
+            out_q.put((False, "load", "cannot load kernel spec"))
+            return
+        inputs = spec.make_inputs(shape, fill_val=fill_val)
+        ok, msg = verify_correctness(spec, inputs)
+        out_q.put((ok, "", msg))
+    except Exception as exc:  # noqa: BLE001
+        out_q.put((False, "worker", f"{type(exc).__name__}: {exc}"))
+
+
+def run_stage_isolated(kernel_path: str, spec_for_skip: OperatorSpec,
+                       shape: tuple, fill_val=None,
+                       stage_timeout_s: float = 240.0) -> "tuple[bool, str]":
+    """Run one verification stage in a spawned subprocess with a hard timeout.
+
+    A hanging kernel (documented for small m in this repo: nbm in {3,4,5})
+    would otherwise freeze the whole harness loop. On timeout the stage fails
+    with a `stage_hang` detail so the orchestrator can react; the parent
+    records which shape to reproduce.
+    """
+    if shape and len(shape) == 1 and not all(d % (spec_for_skip.alignment or 1) == 0 for d in shape):
+        return True, ""  # skipped by alignment (spec already evaluated)
+
+    if not _torch_cuda_available():
+        # In-process fallback when there is no GPU (CI CPU-only environments).
+        inputs = spec_for_skip.make_inputs(shape, fill_val=fill_val)
+        return verify_correctness(spec_for_skip, inputs)
+
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    out_q = ctx.Queue()
+    proc = ctx.Process(target=_verify_stage_worker,
+                       args=(kernel_path, shape, fill_val, out_q),
+                       name=f"verify-stage-{shape}")
+    proc.start()
+    proc.join(stage_timeout_s)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+        return False, f"stage_hang: timed out after {stage_timeout_s:.0f}s (reproduce with this shape)"
+    try:
+        ok, tag, msg = out_q.get_nowait()
+    except Exception:
+        return False, f"stage crashed without report (exitcode={proc.exitcode})"
+    if not ok:
+        return False, msg or tag or "verification failed"
+    return True, ""
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def run_safety_verification(spec: OperatorSpec,
+                            *,
+                            kernel_path: Optional[str] = None,
+                            stage_timeout_s: float = 240.0) -> HarnessResult:
     """Run the 5-stage correctness harness on *spec*.
 
     Stages:
@@ -173,15 +259,22 @@ def run_safety_verification(spec: OperatorSpec) -> HarnessResult:
     """
     import torch
 
-    def _verify(shape: tuple[int, ...], fill_val: Optional[float] = None) -> tuple[bool, str]:
-        inputs = spec.make_inputs(shape, fill_val=fill_val)
-        return verify_correctness(spec, inputs)
-
     def _shape_supported(shape: tuple[int, ...]) -> bool:
         """A shape is supported when it respects the kernel's alignment (if any)."""
         if not spec.alignment:
             return True
         return all(d % spec.alignment == 0 for d in shape)
+
+    def _verify(shape: tuple[int, ...], fill_val: Optional[float] = None) -> tuple[bool, str]:
+        # Isolated subprocess with hard timeout when a kernel_path is given: a
+        # hanging kernel must fail its stage, never freeze the loop.
+        if kernel_path is not None:
+            if not _shape_supported(shape):
+                return True, ""  # handled as skip below
+            return run_stage_isolated(kernel_path, spec, shape, fill_val,
+                                      stage_timeout_s=stage_timeout_s)
+        inputs = spec.make_inputs(shape, fill_val=fill_val)
+        return verify_correctness(spec, inputs)
 
     skipped: list[str] = []
 
@@ -687,7 +780,7 @@ class KernelAgent:
         if spec is None:
             return HarnessResult(False, "load", f"cannot load kernel spec: {kernel_path}")
         spec.num_inputs = num_inputs
-        return run_safety_verification(spec)
+        return run_safety_verification(spec, kernel_path=kernel_path)
 
     # -- benchmark (local) ---------------------------------------------------
 
@@ -1024,7 +1117,7 @@ def run_safety_verification_standalone(
     print(f"  File:      {kernel_path}")
     print(f"  Reference: {spec.ref_fn.__name__ if spec.ref_fn else '(none — crash-only)'}")
 
-    result = run_safety_verification(spec)
+    result = run_safety_verification(spec, kernel_path=kernel_path)
 
     print(f"  Passed:  {result.passed}")
     if not result.passed:
@@ -1143,6 +1236,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--port", type=int, default=DEFAULT_PORT)
     p_run.add_argument("--host", default=DEFAULT_HOST)
     p_run.add_argument("--agent", default="kernel-dev", help="opencode agent name")
+    # v2 loop knobs (tools/harness_loop.py)
+    p_run.add_argument("--candidates", type=int, default=1,
+                       help="Mutually exclusive optimization variants per iteration (default 1)")
+    p_run.add_argument("--explore", action="store_true",
+                       help="Two-phase: agent first profiles and returns an evidence-backed "
+                            "hypothesis list (RESULT.hypotheses) that seeds later candidates")
+    p_run.add_argument("--gap-near-sol-stop", type=float, default=1.1,
+                       help="Stop when SOL gap <= this (default 1.1 = within 10%)")
+    p_run.add_argument("--gap-structural", type=float, default=5.0,
+                       help="Above this SOL gap allow structural changes (keep threshold 8%)")
+    p_run.add_argument("--no-lint", action="store_true", help="Skip kernel_lint advisory checks")
+    p_run.add_argument("--no-probes", action="store_true",
+                       help="Skip running archived regression probes during verify")
+    p_run.add_argument("--loop", choices=["legacy", "v2"], default="v2",
+                       help="Harness loop implementation (default v2 pluggable)")
 
     # harness
     p_harness = sub.add_parser("verify", help="Run safety harness on a kernel")
@@ -1215,12 +1323,24 @@ def main() -> None:
             logger.error("cannot connect to opencode server at %s", agent.base_url)
             sys.exit(1)
         agent.create_session(title=f"kernel-opt:{pathlib.Path(args.kernel).name}")
-        results = agent.optimize_loop(
-            args.kernel, args.task,
-            max_iterations=args.max_iter, agent=args.agent,
+
+        from tools.harness_loop import HarnessLoop, LoopConfig
+
+        cfg = LoopConfig(
+            max_iterations=args.max_iter,
             prompt_timeout_ms=int(args.timeout_min * 60_000),
+            agent=args.agent,
+            num_candidates=args.candidates,
+            explore_first=args.explore,
+            gap_structural=args.gap_structural,
+            gap_near_sol_stop=args.gap_near_sol_stop,
+            run_lint=not args.no_lint,
+            run_regression_probes=not args.no_probes,
         )
-        # Save results
+        loop = HarnessLoop(agent, args.kernel, cfg)
+        logger.info("loop hooks: %s (pluggable: register_hook)", list(loop.hooks))
+        results = loop.run(args.task)
+        # results persisted by report hook; also keep legacy write for compat
         out_path = ROOT / "experiments" / f"{pathlib.Path(args.kernel).stem}_results.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(results, indent=2))
