@@ -50,7 +50,7 @@ If you use this codebase, or otherwise find our work valuable, please cite DistR
 ```bibtex
 @misc{ThunderMuon2026,
   title   = {ThunderMuon : Bridging Specttral Optimization and Hardware Efficiency for Vision Tasks},
-  author  = {LEI WANG, Mingzhe Zheng, Hao Gu, Hui Guo, Bei Liu, Sirui Han, Wei Xue, Qifeng Chen, Yike Guo},
+  author  = {LEI WANG, Mingzhe Zheng, Erke Xia, Tillo Juraboev, Hao Gu, Hui Guo, Bei Liu, Sirui Han, Wei Xue, Qifeng Chen, Yike Guo},
   year    = {2026},
   url     = {https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels}
 }

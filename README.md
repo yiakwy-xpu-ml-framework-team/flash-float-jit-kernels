@@ -18,7 +18,7 @@ This repository is complemntary of "FlashFloat" with JIT Kernels
 
 - April 27 2026, [🔥 ultra low latency topk , reduced maximum 50% 🚀 batch=1 latency for 1-M context 🎯!](#Ultra-Low-Latency-TopK-Indexer)
 
-- May 15 2026, [⚡ thunder muon : symmetric gemm, up to 1.88x 💥 acceleration for low batch GEMM, onchip splitk bulk reduction supported 📣](https://raw.githubusercontent.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/main/docs/symmetric_gemm.md)
+- May 15 2026, [⚡ thunder muon : symmetric gemm, up to 1.88x 💥 acceleration for low batch GEMM, onchip splitk bulk reduction supported 📣](https://raw.githubusercontent.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels/main/docs/ThunderMuon/symmetric_gemm.md)
 
 
 <h2 id="Ultra-Low-Latency-TopK-Indexer">🔥 Ultra Low Latency TopK Indexer</h2>
