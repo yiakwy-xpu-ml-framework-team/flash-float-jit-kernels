@@ -42,3 +42,16 @@ Our algorithm naturally supports batched gemm, where the batch dimension are req
 | 8192.0 | 4.0 | 6354.944229 | 5169.951916 | 5165.328026 | 3469.984055 | 1.83x |
 | 8192.0 | 8.0 | 12880.000114 | 10903.200150 | 10017.248154 | 6719.792128 | 1.92x |
 | 8192.0 | 16.0 | 29570.655823 | 21074.111938 | 21681.424141 | 13627.840042 | 2.17x |
+
+## Citation
+
+If you use this codebase, or otherwise find our work valuable, please cite DistRadixTopK2026:
+
+```bibtex
+@misc{ThunderMuon2026,
+  title   = {ThunderMuon : Bridging Specttral Optimization and Hardware Efficiency for Vision Tasks},
+  author  = {LEI WANG, Mingzhe Zheng, Hao Gu, Hui Guo, Bei Liu, Sirui Han, Wei Xue, Qifeng Chen, Yike Guo},
+  year    = {2026},
+  url     = {https://github.com/yiakwy-xpu-ml-framework-team/flash-float-jit-kernels}
+}
+```
