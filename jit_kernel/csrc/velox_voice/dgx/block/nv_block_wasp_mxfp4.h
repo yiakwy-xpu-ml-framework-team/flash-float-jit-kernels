@@ -131,7 +131,8 @@ struct BlackwellPersistentMxfp4Pipeline {
     nvgpu::arch::warpgroup_sync<TOTAL_THREADS>();
 
     const int total_tiles = num_blocks_m * num_blocks_n;
-    int local_task_id = blockIdx.y; 
+    int local_task_id = blockIdx.x;
+     
     nvgpu::arch::warpgroup_sync<TOTAL_THREADS>();
 
     for (int tile = local_task_id; tile < total_tiles; tile += gridDim.x) {
