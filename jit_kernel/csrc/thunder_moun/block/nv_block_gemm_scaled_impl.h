@@ -449,9 +449,7 @@ struct HopperPersistentSplitKPipeline {
                           "r"(block_idx_n * BN), "r"(block_idx_m * BM)
                         : "memory"
                     );
-    #if (defined(USE_INPALCE_TRI_TRANSPOSE)) && USE_INPALCE_TRI_TRANSPOSE
                     asm volatile("cp.async.bulk.commit_group;");
-    #endif
                 }
 
                 // NOTE (yiakwy) :  transpose copy to upper right
@@ -465,6 +463,7 @@ struct HopperPersistentSplitKPipeline {
 
                     // NOTE (yiakwy) : inplace transpose
                     frag_view._transpose_opt();
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
                     if (threadIdx.x == 0) {
 
@@ -515,6 +514,7 @@ struct HopperPersistentSplitKPipeline {
 #else
 
                     frag_view.transpose(shmem_transpose);
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
                     if (threadIdx.x == 0) {
 
@@ -557,10 +557,6 @@ struct HopperPersistentSplitKPipeline {
 
                     } // outplace copy
 
-                // asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
-                } // outplace copy
-
-                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 
 #endif // USE_INPALCE_TRI_TRANSPOSE
 
