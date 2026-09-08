@@ -188,8 +188,69 @@ configs = [
     (256, 128, 128),
     (512, 512, 2048),    # multi-tile
     (1024, 512, 1024),
+    (2048, 128, 2048),
+    (2048, 256, 2048),
+    (2048, 512, 2048),
     (2048, 2048, 2048),  # large
+    (2048, 1024, 2048),
 ]
+
+
+# M = [128, 256, 512, 1024, 2048]
+# N = [128, 256, 512, 1024, 2048]
+# K = [64, 128, 1024, 2048]
+
+# configs = list(itertools.product(M, N , K))
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["M", "N", "K"],
+        x_vals=configs,
+        line_arg="provider",
+        line_vals=[
+            "torch",
+            "dgx_mxfp4_gemm",
+        ],
+        line_names=[
+            "torch",
+            "dgx_mxfp4_gemm",
+        ],
+        styles=[
+            ("red", "-"),
+            ("blue", "-"),
+        ],
+        ylabel="Latency",
+        plot_name="velox-voice-dgx_maxfp4_gemm-performance",
+        args={},
+    )
+)
+def benchmark(M:int, N:int, K:int, provider) -> None:
+    torch.manual_seed(SEED)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+
+    xq, xs = quantize_w(x)
+    wq, ws = quantize_w(w)
+
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    if provider == "torch":
+        fn = lambda: x @ w.T
+    elif provider == "dgx_mxfp4_gemm":
+        fn = lambda: dgx_mxfp4_gemm(xq, wq, xs, ws)
+
+    # warm up
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+
+    return ms * 1000, min_ms * 1000, max_ms * 1000
 
 
 if __name__ == "__main__":
@@ -207,4 +268,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     if not DEBUG:
         print("Starting performance benchmark...")
-        # benchmark.run(print_data=True)
+        benchmark.run(print_data=True)

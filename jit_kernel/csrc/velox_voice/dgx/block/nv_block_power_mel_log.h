@@ -59,7 +59,7 @@ struct PowerMelLogPipeline {
 
       const int wm_i = warpid / WN;
       const int wn_i = warpid % WN;
-      
+
       const int warp_m_base = wm_i * TM;
       const int warp_n_base = wn_i * TN;
 
@@ -87,10 +87,13 @@ struct PowerMelLogPipeline {
 
               float re0 = spec_s[(spec_row * BK + spec_col) * 2];
               float im0 = spec_s[(spec_row * BK + spec_col) * 2 + 1];
+
               float re1 = spec_s[((spec_row + 8) * BK + spec_col) * 2];
               float im1 = spec_s[((spec_row + 8) * BK + spec_col) * 2 + 1];
+
               float re2 = spec_s[(spec_row * BK + spec_col + 4) * 2];
               float im2 = spec_s[(spec_row * BK + spec_col + 4) * 2 + 1];
+              
               float re3 = spec_s[((spec_row + 8) * BK + spec_col + 4) * 2];
               float im3 = spec_s[((spec_row + 8) * BK + spec_col + 4) * 2 + 1];
 
