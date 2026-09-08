@@ -5,11 +5,11 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-
 # TODO (yiakwy) : move to triton 3_7, 3_8 (I didn't veriy on triton 3_5)
 
-
 # NOTE (yiakwy): DGX Spark (GB10, sm_121) types.
+#   - No TMA/TensorDescriptor : F = nfft/2 + 1 is always odd, it is hard to use TMA
+#   - mel is tiny and stays hot in L2
 from triton.experimental.gluon.language.nvidia.blackwell import mma_v2
 
 
@@ -95,7 +95,6 @@ def power_mel_log_kernel(
     )
 
     k_width: gl.constexpr = 2 if PRECISION == "fp16x3" else 1
-    
     a_layout: gl.constexpr = gl.DotOperandLayout(parent=mma_layout, operand_index=0, k_width=k_width)
     b_layout: gl.constexpr = gl.DotOperandLayout(parent=mma_layout, operand_index=1, k_width=k_width)
 
@@ -119,7 +118,7 @@ def power_mel_log_kernel(
         base = spec_rows[:, None] + fcurr[None, :] * 2
         real = gl.load(spec_ptr + base, mask=amask, other=0.0)
         imag = gl.load(spec_ptr + base + 1, mask=amask, other=0.0)
-
+        
         # step 1: power = real^2 + imag^2
         power = real * real + imag * imag
 
@@ -138,24 +137,20 @@ def power_mel_log_kernel(
 
     if HAS_CMVN:
         cmvn_cols = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(0, mma_layout))
-
         m_mask = cmvn_cols < M
-
         mean_vec = gl.load(cmvn_mean_ptr + cmvn_cols, mask=m_mask, other=0.0)
         istd_vec = gl.load(cmvn_istd_ptr + cmvn_cols, mask=m_mask, other=1.0)
-
         out = (out - mean_vec[None, :]) * istd_vec[None, :]
 
     ro = off_t + gl.arange(0, BLOCK_T, layout=gl.SliceLayout(1, mma_layout))
     co = off_m + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(0, mma_layout))
-
     omask = (ro < T)[:, None] & (co < M)[None, :]
     gl.store(out_ptr + ro[:, None].to(gl.int64) * M + co[None, :], out, mask=omask)
 
 
 class GluonPowerMelLog:
     """
-    Fused power = |spec|^2 -> mel filterbank -> log (+ optional CMVN).
+    log(( |spec_real|^2 + |spec_imag|^2 ) * mel.T) + CMVN
 
     Args:
         spec: complex64 [T, F]
@@ -225,7 +220,6 @@ class GluonPowerMelLog:
 
         num_block_t = triton.cdiv(T, self.BLOCK_T)
         num_block_m = triton.cdiv(M, self.BLOCK_M)
-
         grid = (num_block_t * num_block_m,)
 
         power_mel_log_kernel[grid](
