@@ -121,6 +121,8 @@ def dgx_mxfp4_gemm(pack_a, pack_b, scale_a, scale_b,
     """pack_a [M, K/2] u8; pack_b [N, K/2] u8; row/col scale tensor u8; -> out [M, N] f32."""
 
     M, K2 = pack_a.shape
+
+    # TODO (yiakwy) : add optional out
     out = torch.empty(M, pack_b.shape[0], device=pack_a.device, dtype=torch.float32)
 
     module = _jit_vx_dgx_nvfp4_gemm_module(num_producer_warps, num_consumer_warps, group_size_m, cluster_size_m)
@@ -129,4 +131,53 @@ def dgx_mxfp4_gemm(pack_a, pack_b, scale_a, scale_b,
         module.dgx_mxfp4_gemm(
             pack_a, pack_b, scale_a, scale_b, out
         )
+    return out
+
+@functools.cache
+def _jit_vx_dgx_power_mel_log_module(BLOCK_SIZE_M=64, BLOCK_SIZE_N=80, BLOCK_SIZE_K=64):
+    """Build dgx_mxfp4_gemm with P producer warps and C consumer warps."""
+
+    return _build_cuda_module(
+        f"power_mel_log_block_{BLOCK_SIZE_M}x{BLOCK_SIZE_N}x{BLOCK_SIZE_K}",
+        ("dgx/fast_power_mel_log.cu",),
+        (),
+        extra_cuda_cflags=(
+            "-O2",
+            "--use_fast_math",
+            "-std=c++17",
+            f"-I{CSRC}/dgx",
+        ),
+        arch_override="12.1a",
+    )
+
+def power_mel_log(spec, mel, cmvn_mean=None, cmvn_istd=None):
+    T, F = spec.shape
+    M = mel.shape[0]
+
+    BK, BM, BN = 64, 64, 80
+    F_padded = ((F + BK - 1) // BK) * BK
+
+    if (F_padded // BK) % 2 != 0:
+        F_padded += BK
+
+    # TODO (yiakwy) : remove padding
+    mel_g = torch.zeros(F_padded, M, device=mel.device, dtype=mel.dtype)
+    mel_g[:F, :M] = mel.t()
+
+    # TODO (yiakwy) : add optional out
+    out = torch.empty(T, M, device=spec.device, dtype=torch.float32)
+
+    # TODO (yiakwy) : remove
+    zero = torch.zeros(M, device=mel.device, dtype=mel.dtype)
+
+    module = _jit_vx_dgx_power_mel_log_module()
+
+    HAS_CMVN = cmvn_mean is not None and cmvn_istd is not None
+
+    if not HAS_CMVN:
+        cmvn_mean = zero
+        cmvn_istd = zero
+
+    with tvm_ffi.use_torch_stream():
+        module.power_mel_log(spec, mel_g, cmvn_mean, cmvn_istd, out, HAS_CMVN)
     return out

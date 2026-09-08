@@ -9,9 +9,10 @@ import triton.language as tl
 import triton.testing
 
 
-from jit_kernel.triton3_5.gluon.power_mel_log_no_tma import GluonPowerMelLog
-from jit_kernel.triton3_5.gluon.power_mel_log import GluonPowerMelLog as GluonPowerMelLogTMA
+from jit_kernel.triton3_7.gluon.power_mel_log_no_tma import GluonPowerMelLog
+from jit_kernel.triton3_7.gluon.power_mel_log import GluonPowerMelLog as GluonPowerMelLogTMA
 
+from jit_kernel.velox_voice import power_mel_log
 
 SEED = 42
 
@@ -85,6 +86,7 @@ def calculate_diff(T, F, M, atol=5e-2):
         ("no tma (fp16x3)", GluonPowerMelLog(precision="fp16x3"), spec),
         ("tma (tf32x3)", GluonPowerMelLogTMA(), aligned_spec),
         ("tma (fp16x3)", GluonPowerMelLogTMA(precision="fp16x3"), aligned_spec),
+        ("cuda", power_mel_log, spec)
     ]:
         cuda_out = op(inp, mel, None, None).cpu()
         abs_err = (cuda_out - ref).abs()
@@ -119,19 +121,19 @@ configs = list(itertools.product(T, F, M))
             "torch",
             "gluon_power_mel_log_fp16x3_no_tma_ref",
             "gluon_power_mel_log_tma_fp16x3_ref",
-            # "cuda_power_mel_log",
+            "cuda_power_mel_log",
         ],
         line_names=[
             "torch",
             "gluon_no_tma_ref",
             "gluon_tma_ref",
-            # "cuda_power_mel_log",
+            "cuda",
         ],
         styles=[
             ("red", "-"),
             ("blue", "-"),
             ("green", "-"),
-            # ("yellow", "-"),
+            ("yellow", "-"),
         ],
         ylabel="Latency",
         plot_name="velox-voice-power_mel_log-performance",
@@ -161,7 +163,7 @@ def benchmark(T: int, F: int, M: int, provider) -> None:
     elif provider == "gluon_power_mel_log_tma_fp16x3_ref":
         fn = lambda: power_mel_log_op_tma(aligned_spec, mel)
     elif provider == "cuda_power_mel_log":
-        pass
+        fn = lambda: power_mel_log(spec, mel)
 
     # warm up
     for _ in range(10):
