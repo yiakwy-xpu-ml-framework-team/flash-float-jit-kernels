@@ -187,7 +187,7 @@ class GluonPowerMelLog:
 
         self.NUM_WARPS = NUM_WARPS
 
-        # NOTE (yiakwy): we run the kernel both on NVIDIA Hopper GPUs and on DGX Spark
+        # NOTE (yiakwy): check Hopper
         props = torch.cuda.get_device_properties(0)
         self.NUM_CUs = props.multi_processor_count  # 48 for dgx spark and 132 for hopper
 

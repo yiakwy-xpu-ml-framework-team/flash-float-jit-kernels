@@ -10,6 +10,7 @@ import triton.testing
 
 
 from jit_kernel.triton3_5.gluon.power_mel_log_no_tma import GluonPowerMelLog
+from jit_kernel.triton3_5.gluon.power_mel_log import GluonPowerMelLog as GluonPowerMelLogTMA
 
 
 SEED = 42
@@ -49,6 +50,24 @@ def power_mel_log_einsum(spec, mel, cmvn_mean=None, cmvn_istd=None):
 COND_THRESHOLD = 1e-2
 
 
+def make_16B_aligned_aligned(spec):
+    T, F = spec.shape
+
+    # NOTE (yiakwy) : using TMA requires 16B-alignment stride
+    Fc = triton.cdiv(F, 4) * 4
+
+    real_buf = torch.empty(T, Fc, device=spec.device, dtype=torch.float32)
+    imag_buf = torch.empty(T, Fc, device=spec.device, dtype=torch.float32)
+
+    spec_real = real_buf[:, :F]
+    spec_imag = imag_buf[:, :F]
+
+    spec_real.copy_(spec.real)
+    spec_imag.copy_(spec.imag)
+
+    return (spec_real, spec_imag)
+
+
 def calculate_diff(T, F, M, atol=5e-2):
     torch.manual_seed(SEED)
     spec = torch.randn(T, F, device="cuda", dtype=torch.cfloat)
@@ -58,19 +77,27 @@ def calculate_diff(T, F, M, atol=5e-2):
     ref = ref.cpu()
     mask = (power_mel_ref > COND_THRESHOLD).cpu()
 
-    power_mel_log_op = GluonPowerMelLog()
-    cuda_out = power_mel_log_op(spec, mel, None, None).cpu()
+    aligned_spec = make_16B_aligned_aligned(spec)
 
-    abs_err = (cuda_out - ref).abs()
-    diff = abs_err[mask].max().item()
+    results = []
+    for name, op, inp in [
+        ("no tma (tf32x3)", GluonPowerMelLog(), spec),
+        ("no tma (fp16x3)", GluonPowerMelLog(precision="fp16x3"), spec),
+        ("tma (tf32x3)", GluonPowerMelLogTMA(), aligned_spec),
+        ("tma (fp16x3)", GluonPowerMelLogTMA(precision="fp16x3"), aligned_spec),
+    ]:
+        cuda_out = op(inp, mel, None, None).cpu()
+        abs_err = (cuda_out - ref).abs()
+        diff = abs_err[mask].max().item()
+        mean_diff = abs_err[mask].mean().item()
+        results.append((name, diff, mean_diff, diff < atol))
+        print(f"   {name}: max_diff={diff:.4f} (all-entries={abs_err.max().item():.4f}) ok={diff < atol}")
 
-    mean_diff = abs_err[mask].mean().item()
-    diff_all = abs_err.max().item()
+    diff = results[0][1]
+    mean_diff = results[0][2]
+    ok = all(r[3] for r in results)
 
-    ok = diff < atol
-
-    print(f"✅ {T}x{F}x{M} power_mel_log: max_diff={diff:.4f} "
-          f"(all-entries={diff_all:.4f}, well-conditioned={mask.double().mean() * 100:.1f}%) ok={ok}")
+    print(f"✅ {T}x{F}x{M} power_mel_log ok={ok}")
     return diff, mean_diff, ok
 
 
@@ -90,21 +117,21 @@ configs = list(itertools.product(T, F, M))
         line_arg="provider",
         line_vals=[
             "torch",
-            "gluon_power_mel_log_ref",
-            "gluon_power_mel_log_fp16x3",
+            "gluon_power_mel_log_fp16x3_no_tma_ref",
+            "gluon_power_mel_log_tma_fp16x3_ref",
             # "cuda_power_mel_log",
         ],
         line_names=[
             "torch",
-            "gluon_power_mel_log tf32x3",
-            "gluon_power_mel_log fp16x3",
+            "gluon_no_tma_ref",
+            "gluon_tma_ref",
             # "cuda_power_mel_log",
         ],
         styles=[
             ("red", "-"),
             ("blue", "-"),
             ("green", "-"),
-            # ("cyan", "-"),
+            # ("yellow", "-"),
         ],
         ylabel="Latency",
         plot_name="velox-voice-power_mel_log-performance",
@@ -119,17 +146,20 @@ def benchmark(T: int, F: int, M: int, provider) -> None:
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
 
-    power_mel_log_op = GluonPowerMelLog()
-    power_mel_log_op_fp16 = GluonPowerMelLog(precision="fp16x3")
+    power_mel_log_op = GluonPowerMelLog(precision="fp16x3")
+    power_mel_log_op_tma = GluonPowerMelLogTMA(precision="fp16x3")
+
+    # NOTE (yiakwy) : make 16B-aligned spec
+    aligned_spec = make_16B_aligned_aligned(spec)
 
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "torch":
         fn = lambda: power_mel_log_einsum(spec, mel)
-    elif provider == "gluon_power_mel_log_ref":
+    elif provider == "gluon_power_mel_log_fp16x3_no_tma_ref":
         fn = lambda: power_mel_log_op(spec, mel)
-    elif provider == "gluon_power_mel_log_fp16x3":
-        fn = lambda: power_mel_log_op_fp16(spec, mel)
+    elif provider == "gluon_power_mel_log_tma_fp16x3_ref":
+        fn = lambda: power_mel_log_op_tma(aligned_spec, mel)
     elif provider == "cuda_power_mel_log":
         pass
 
