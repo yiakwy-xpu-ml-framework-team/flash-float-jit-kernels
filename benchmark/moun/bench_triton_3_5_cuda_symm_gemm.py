@@ -446,7 +446,9 @@ configs = list(itertools.product(M, dummy))
 B = [1, 4, 16]
 BATCH_CONFIGS = list(itertools.product(M, B))
 
-BATCH_BENCH_CONFIGS = list(itertools.product([2048, 4096, 8192], [1, 4, 8, 16]))
+BATCH_BENCH_CONFIGS = list(
+    itertools.product([2048, 4096, 5376, 8192, 14336], [1, 4, 8, 16])
+)
 
 
 @triton.testing.perf_report(
@@ -555,6 +557,9 @@ def benchmark(m: int, B: int, provider) -> None:
     )
 )
 def benchmark_batch(m: int, B: int, provider) -> None:
+    # NOTE (yiakwy) : the triton reference (XTX) runs out of bounds at B=16 x m=14336
+    if provider == "triton_impl_ref" and m == 14336 and B == 16:
+        return float("nan"), float("nan"), float("nan")
     # NOTE (yiakwy) : batched symmetric gemm benchmark. All providers take the same
     # contiguous (B, m, m) input; batch is the outter-most dim for the batched kernels.
     torch.manual_seed(SEED)
