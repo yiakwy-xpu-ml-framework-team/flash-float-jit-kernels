@@ -354,8 +354,13 @@ extern "C" int symm_gemm_fp8_block_scaled(
         cluster_size_m = 1;
     }
 
-    // NOTE (yiakwy) : on-chip NoC reduction does not support TMA broadcast for now
+    // TODO (yiakwy) : on-chip NoC reduction does not support TMA broadcast for now
     if (split_k > 1) {
+        cluster_size_m = 1;
+    }
+
+    // TODO (yiakwy) : on-chip NoC reduction does not benefit batch symmetric gemm for now
+    if (B > 1) {
         cluster_size_m = 1;
     }
 
