@@ -106,6 +106,7 @@ void hopper_symm_gemm_kernel_entry(
     const int M, const int N, const int K, const int B,
     const int total_symmetric_tiles,
     const int num_blocks_m, const int num_blocks_n, const int cluster_size_m,
+    const int k_tiles_total,
     const __grid_constant__ CUtensorMap tma_desc_X,
     const __grid_constant__ CUtensorMap tma_desc_W,
     const __grid_constant__ CUtensorMap tma_desc_O,
@@ -125,6 +126,7 @@ void hopper_symm_gemm_kernel_entry(
             total_symmetric_tiles,
             num_blocks_m,
             num_blocks_n,
+            k_tiles_total,
             smem_buffer
         );
     } else {
@@ -138,6 +140,7 @@ void hopper_symm_gemm_kernel_entry(
             total_symmetric_tiles,
             num_blocks_m,
             num_blocks_n,
+            k_tiles_total,
             smem_buffer
         );
     }
@@ -305,16 +308,8 @@ extern "C" int symm_gemm_fp8_block_scaled(
 #endif
 
     constexpr int SCLAE_BLOCK_SIZE_K = 128;
-    constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
     auto& kernel = hopper_symm_gemm_kernel_entry;
-
-    uint32_t required_smem_bytes = sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_M, K_BLOCK_K>) * K_STAGES +
-                                   sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_N, K_BLOCK_K>) * K_STAGES +
-                                   sizeof(xpu::SharedBlock<fp16_t, K_BLOCK_M, K_BLOCK_N>) +
-                                   sizeof(fp32_t) * (K_BLOCK_M * K_TILES_TOTAL + K_TILES_TOTAL);
-
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, required_smem_bytes);
 
     int num_blocks_m = CEILDIV(M, K_BLOCK_M);
     int num_blocks_n = CEILDIV(N, K_BLOCK_N);
@@ -346,7 +341,16 @@ extern "C" int symm_gemm_fp8_block_scaled(
     }
 
     int cluster_size_m = MIN(4, CLUSTER_SIZE_M);
+
+    // disable cluster when grid_mn does not divide cluster_size_m
     if (grid_mn % cluster_size_m != 0) {
+        cluster_size_m = 1;
+    }
+
+    // disable cluster if the last group's column height is ODD OR
+    // the per-CTA task count is unbalanced over the persistent grid
+    if ( (num_blocks_m % GROUP_SIZE_M) % 2 != 0 ||
+         (total_symmetric_tiles % grid_mn) % 2 != 0 ) {
         cluster_size_m = 1;
     }
 
@@ -357,6 +361,21 @@ extern "C" int symm_gemm_fp8_block_scaled(
 
     int max_split_k = CEILDIV(MAX_SPLIT_K, cluster_size_m);
     split_k = MIN(split_k, max_split_k);
+
+    const int k_tiles_total = CEILDIV( CEILDIV(K, SCLAE_BLOCK_SIZE_K), (int)split_k);
+    uint32_t scale_bytes = sizeof(fp32_t) * (K_BLOCK_M * k_tiles_total + k_tiles_total);
+
+    if (split_k > 1) {
+        // the bulk split-k staging aliases the scale region and needs BM*BN*2 bytes
+        scale_bytes = MAX(scale_bytes, (uint32_t)K_BLOCK_M * K_BLOCK_N * sizeof(fp16_t));
+    }
+
+    uint32_t required_smem_bytes = sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_M, K_BLOCK_K>) * K_STAGES +
+                                   sizeof(xpu::SharedBlock<fp8_t, K_BLOCK_N, K_BLOCK_K>) * K_STAGES +
+                                   sizeof(xpu::SharedBlock<fp16_t, K_BLOCK_M, K_BLOCK_N>) +
+                                   scale_bytes;
+
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, required_smem_bytes);
 
     dim3 grid(split_k, grid_mn, 1);
     dim3 block(TOTAL_WARP_THREADS, 1, 1);
@@ -380,6 +399,7 @@ extern "C" int symm_gemm_fp8_block_scaled(
     cudaError_t state = cudaLaunchKernelEx(&launch_config, kernel,
         (const fp8_t*)X_ptr, (const fp8_t*)W_ptr, (const fp32_t*)scale_X, (fp32_t*)scale_W, (fp16_t*)Out_ptr,
         M, N, K, B, total_symmetric_tiles, num_blocks_m, num_blocks_n, cluster_size_m,
+        k_tiles_total,
         desc_X, desc_W, desc_O, desc_O_swizzle, desc_O_trans
     );
 
