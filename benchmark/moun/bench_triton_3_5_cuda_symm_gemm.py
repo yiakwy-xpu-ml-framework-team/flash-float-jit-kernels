@@ -185,9 +185,7 @@ def calculate_diff(m, dummy):
     print("diff (gluon tma ref): ", diff)
     torch.testing.assert_close(o_gluon_ref, o_torch_ref, rtol=5e-01, atol=1e-03)
 
-    o_symm_fp8_tril = symm_gemm_block_scaled(
-        xq_fp8, wq_fp8, xs_0, xs_1
-    ).cpu()
+    o_symm_fp8_tril = symm_gemm_block_scaled(xq_fp8, wq_fp8, xs_0, xs_1).cpu()
 
     print("o_symm_fp8_tril (cuda symm) : ", o_symm_fp8_tril)
 
@@ -307,7 +305,9 @@ def calculate_diff_batch(m, B):
     x = torch.randn(B, m, m, dtype=torch.bfloat16, device="cuda")
     xs_0 = torch.ones((B, m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
     xs_1 = torch.ones(
-        (B, triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+        (B, triton.cdiv(m, 128), triton.cdiv(m, 128)),
+        dtype=torch.float32,
+        device="cuda",
     )
 
     xq_fp8 = x.to(torch.float8_e4m3fn)
@@ -332,9 +332,6 @@ def calculate_diff_batch(m, B):
 
     e = rel_err(o_gluon_ref, o_torch_ref)
     print(f"gluon ref rel err (Frobenius) : {e:.4e}")
-
-    import pdb
-    # pdb.set_trace()
 
     torch.testing.assert_close(o_gluon_ref, o_torch_ref, rtol=5e-02, atol=1e-02)
 
@@ -440,9 +437,10 @@ def calculate_diff_batch(m, B):
     )
 
 
-M = [2048, 4096, 8192]
+M = [2048, 4096, 5376, 8192, 14336]
 dummy = [1]
 
+# M + [5376, 14336]
 configs = list(itertools.product(M, dummy))
 
 B = [1, 4, 16]
@@ -450,9 +448,10 @@ BATCH_CONFIGS = list(itertools.product(M, B))
 
 BATCH_BENCH_CONFIGS = list(itertools.product([2048, 4096, 8192], [1, 4, 8, 16]))
 
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["m", "dummy"],
+        x_names=["m", "B"],
         x_vals=configs,
         line_arg="provider",
         line_vals=[
@@ -479,7 +478,7 @@ BATCH_BENCH_CONFIGS = list(itertools.product([2048, 4096, 8192], [1, 4, 8, 16]))
         args={},
     )
 )
-def benchmark(m: int, dummy: int, provider) -> None:
+def benchmark(m: int, B: int, provider) -> None:
     torch.manual_seed(SEED)
 
     stream = torch.cuda.Stream()
@@ -566,7 +565,9 @@ def benchmark_batch(m: int, B: int, provider) -> None:
     x = torch.randn(B, m, m, dtype=torch.bfloat16, device="cuda")
     xs_0 = torch.ones((B, m, triton.cdiv(m, 128)), dtype=torch.float32, device="cuda")
     xs_1 = torch.ones(
-        (B, triton.cdiv(m, 128), triton.cdiv(m, 128)), dtype=torch.float32, device="cuda"
+        (B, triton.cdiv(m, 128), triton.cdiv(m, 128)),
+        dtype=torch.float32,
+        device="cuda",
     )
 
     x_fp8 = x.to(torch.float8_e4m3fn)
@@ -607,16 +608,16 @@ if __name__ == "__main__":
 
     for cfg in test_configs:
         print(f"cfg : {cfg}")
-        # calculate_diff(*cfg)
+        calculate_diff(*cfg)
 
     for cfg in test_batch_configs:
         print(f"batch cfg : {cfg}")
-        calculate_diff_batch(*cfg)
+        # calculate_diff_batch(*cfg)
 
     print("\n" + "=" * 60)
     if not DEBUG:
         print("Starting performance benchmark...")
-        # benchmark.run(print_data=True)
+        benchmark.run(print_data=True)
 
         print("\n" + "=" * 60)
         print("Starting batch performance benchmark...")

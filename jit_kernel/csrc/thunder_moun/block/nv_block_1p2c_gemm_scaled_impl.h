@@ -135,6 +135,7 @@ struct HopperPersistentSplitKPipeline {
         int total_symmetric_tiles,
         int num_blocks_m,
         int num_blocks_n,
+        int K_TILES_TOTAL,
         uint8_t* smem_buffer
     ) {
         using fp8_t = __nv_fp8_e4m3;
@@ -355,7 +356,6 @@ struct HopperPersistentSplitKPipeline {
             OutDtype* shmem_epilogue_trans = shmem_epilogue + BM * BN;
 
             constexpr int SCLAE_BLOCK_SIZE_K = 128;
-            constexpr int K_TILES_TOTAL = (8192 + SCLAE_BLOCK_SIZE_K - 1) / SCLAE_BLOCK_SIZE_K;
 
             offset += sizeof(OutDtype) * BM * BN;
             auto* shmem_XS = reinterpret_cast<float*>(smem_buffer + offset);
@@ -592,7 +592,7 @@ struct HopperPersistentSplitKPipeline {
 
                         // NOTE (yiakwy) : we tried split_k >=2 with on chip reduction, and it does not work; split-2 itself can bring 22% improvement
                         if (split_k >= 2) {
-                            
+
                             nvgpu::arch::tma_wait(__cvta_generic_to_shared(&bulk_reduce_barriers[0]), bulk_reduce_phase);
                             warpgroup_sync();
                             bulk_reduce_phase ^= 1;
