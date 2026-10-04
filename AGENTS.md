@@ -1,5 +1,27 @@
 # Instructions for AI Agents Working on flash-float-jit-kernels
 
+## Persistent Memory — READ EVERY SESSION
+We suppressed (2026.10.4) DeepSelect for almost all TopK workloads :
+
+| workload | bottleneck | method | vs DeepSelect |
+|---|---|---|---|
+| top512/1024/2048, **L ≤ 16384** | per-round cross-CTA NoC reduce + cluster barriers dominate the tiny work | **single-CTA histogram-first radix** (`top_small_k.cuh`): one CTA/row, one histogram pass, single-warp suffix sum, deterministic per-bin compaction, residual radix | **1.03–1.44×** (k512 1.09, k1024 1.03, k2048 1.44) |
+| top2048, **L > 16384** | single CTA cannot scale with L | distributed NoC cluster radix | **1.23–1.54×** |
+| top1024, **L ≥ 98304** | fixed cluster cost amortized over a long row | distributed NoC cluster radix | **1.09–1.20×** |
+| top512, **L ≥ 98304** | same | distributed NoC cluster radix | **1.01–1.09×** |
+| ragged short (`row_starts` set, wide tensor) | host dispatch can't read `lengths` without a sync (breaks CUDA-graph) | sync-free double launch (single-CTA + distributed `skip_short_len`) | 0.83–1.14× |
+
+Key measured facts driving the design (see the memory doc for detail):
+* **Memory is not the bottleneck.** DeepSelect's TMA `wait` is ~1% of its time;
+  our fused TMA probe matched the non-TMA version exactly. TMA does not pay at
+  short L.
+* **The wall was the per-round cross-CTA `cluster_reduce`** (~11 µs, ≈1.4× DeepSelect's
+  whole kernel) and the **compaction writes** (one contended `atomicAdd`) — not loads.
+* **Never compact with a sort:** the retired prototype sorted a bounded survivor
+  every 512-elem segment (O(n log²n) + ~55 barriers/sort) → ~100× slower. Use an
+  **O(n) radix select** and keep block barriers near zero (`__syncwarp`, warp suffix sum).
+* Still losing: top512 L=65536 (0.79–0.83×), bs=8 long-L small-K (SM oversubscription).
+
 ## Project Overview
 This repository is a high-performance JIT (Just-In-Time) GPU kernel library for low-latency LLM inference. It contains:
 - **CUDA kernels**: 

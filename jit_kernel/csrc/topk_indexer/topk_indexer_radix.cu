@@ -16,6 +16,20 @@
  attention scores), #    after first round of randix Topk
  */
 
+// TODO (yiakwy) : using sglang headers to support ROCm data types
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cuda.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <optional>
+#include <stdexcept>
+
+// The default (torch JIT) lowering path is built on ATen/libtorch. The optional
+// TVM-FFI lowering path (compiled with -DUSE_TVM_FFI) drops the libtorch
+// dependency entirely and exposes a raw C entry point instead.
+#if !defined(USE_TVM_FFI)
 // TODO (yiakwy) : Aten comes with libtorch, will be removed in favor of tvm-ffi raw C interface
 #include <ATen/core/TensorBase.h>
 #include <ATen/core/TensorBody.h>
@@ -25,14 +39,15 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
+#else
+#include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
 
-// TODO (yiakwy) : using sglang headers to support ROCm data types
-#include <cstddef>
-#include <cstdint>
-#include <cuda.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <optional>
+#ifndef C10_LIKELY
+#define C10_LIKELY(x) (x)
+#define C10_UNLIKELY(x) (x)
+#endif
+#endif
 
 // enable cooperative blocks launch
 #include <cooperative_groups.h>
@@ -59,6 +74,10 @@ namespace cg = cooperative_groups;
 #define SMs 132
 #endif
 
+#ifndef TOPK_HARNESSED_MAX_SPLIT
+#define TOPK_HARNESSED_MAX_SPLIT 8
+#endif
+
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER  // Hopper or Blackwell
 // NOTE(yiakwy) : Enable dshmem via NoC for faster decoding
 #define ENABLE_SM90_FEATURES 1
@@ -67,14 +86,23 @@ namespace cg = cooperative_groups;
 namespace {
 
 constexpr int TopK = 2048;
-constexpr int kThreadsPerBlock = 512;
+
+#ifndef TOPK_NUM_THREADS
+#define TOPK_NUM_THREADS 512
+#endif
+
+constexpr int kThreadsPerBlock = TOPK_NUM_THREADS;
 constexpr int RADIX = 256;
 constexpr int WARP_SIZE = 32;
 
-constexpr size_t kSmem = 32768 / 2;
-constexpr size_t SMEM_INPUT_SIZE = TopK;
-
 constexpr size_t MAX_BIN_CACHE = 4096 * 2;
+
+#ifndef TOPK_MAX_CANDIDATES
+#define TOPK_MAX_CANDIDATES MAX_BIN_CACHE
+#endif
+constexpr size_t SMEM_INPUT_SIZE = TOPK_MAX_CANDIDATES;
+
+constexpr size_t kSmem = 2 * SMEM_INPUT_SIZE * (sizeof(float) + sizeof(unsigned int));
 
 // BASE step radix prefix sum
 template <int BASE>
@@ -148,15 +176,15 @@ struct FastTopKParams {
   int64_t input_stride;
 };
 
-// when length <= TopK, we can directly write the indices
-__device__ void naive_topk_cuda(const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length) {
+// when length <= topk, we can directly write the indices
+__device__ void naive_topk_cuda(const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length, int topk) {
   const auto tid = threadIdx.x;
-  for (int i = tid; i < MIN(TopK, length); i += kThreadsPerBlock) {
+  for (int i = tid; i < MIN(topk, length); i += kThreadsPerBlock) {
     // indice[i] = (i < length) ? i : -1;
     indice[i] = i;
   }
-  if (TopK >= length) {
-    for (int i = tid + length; i < TopK; i += kThreadsPerBlock) {
+  if (topk >= length) {
+    for (int i = tid + length; i < topk; i += kThreadsPerBlock) {
       indice[i] = -1;
     }
   }
@@ -196,12 +224,14 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
 #endif
 }
 
-// TODO (yiakwy) : test
+// NOTE (yiakwy) : residual-domain key. 
 __device__ __forceinline__ auto convert_to_monotonic_8bit(float x) -> uint8_t {
   int bin = __float2int_rd(x);
-  // return (uint8_t)max(0, min(bin, 255));
   return bin;
 }
+
+// Single-CTA short-sequence small-K specialization (top512/1024, L <= 16384).
+#include "top_small_k.cuh"
 
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
@@ -278,6 +308,40 @@ __device__ __forceinline__ void parallel_reduce_histogram(int* s_histogram /*src
 #endif  // end of stage 2  
 }
 
+// TODO (yiakwy) : valid optimizatioin; applied to Top2048 pathway
+
+// Harnessed variant: remove cluster barrier
+__device__ __forceinline__ void parallel_reduce_histogram_harnessed(int* s_histogram /*src and dest*/, int* g_scratch/*dest*/, const int& tx, const bool& is_split_mode, const int& num_splits, const int& split_idx, const int& BLOCK_SIZE) {
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+  if (is_split_mode && num_splits > 1) {
+    cluster.sync();
+
+    if (split_idx == 0) {
+      for (int bin = tx; bin < RADIX; bin += BLOCK_SIZE) {
+        int total = s_histogram[bin];
+#pragma unroll
+        for (int r = 1; r < num_splits; ++r) {
+          int* other_hist = cluster.map_shared_rank<int>(&s_histogram[0], r);
+          total += other_hist[bin];
+        }
+        s_histogram[bin] = total;
+      }
+    }
+    cluster.sync();
+
+    if (split_idx != 0) {
+      for (int bin = tx; bin < RADIX; bin += BLOCK_SIZE) {
+        int* dist_hist = cluster.map_shared_rank<int>(&s_histogram[0], 0);
+        s_histogram[bin] = dist_hist[bin];
+      }
+    }
+    __syncthreads();
+  }
+#else
+  parallel_reduce_histogram(s_histogram, g_scratch, tx, is_split_mode, num_splits, split_idx, BLOCK_SIZE);
+#endif
+}
 
 __device__ __forceinline__ void local_calc_block_offset(int *s_block_count_ptr/*dest*/, int *s_block_offset_ptr/*dest*/, int* g_scratch/*dest*/, const int& tx, const int& lane_id, const int& split_idx, const int& num_splits, const int& threshold_bin, const uint8_t* bin_cache, const float* input, const int& start_offset, const int& end_offset, const int& row_start, const int& BLOCK_SIZE) {
   int local_count = 0;
@@ -313,22 +377,19 @@ __device__ __forceinline__ void local_calc_block_offset(int *s_block_count_ptr/*
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
  auto cluster = cooperative_groups::this_cluster();
 
- if (split_idx == 0) {
+ cluster.sync();
+
+ if (tx == 0) {
    int offset = 0;
-   if (tx == 0) {
-     for (int r = 0; r < num_splits; ++r) {
-       int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
-       int c = *dst_cnt;
-
-       int* dst_off = cluster.map_shared_rank(s_block_offset_ptr, r);
-       *dst_off = offset;
-
-       offset += c;
-     }
+   for (int r = 0; r < split_idx; ++r) {
+     int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
+     offset += *dst_cnt;
    }
+   *s_block_offset_ptr = offset;
  }
 
- cluster.sync();
+ __syncthreads();
+
 #else
  // TODO (yiakwy) : fallback
  if (tx == 0) {
@@ -350,6 +411,46 @@ __device__ __forceinline__ void local_calc_block_offset(int *s_block_count_ptr/*
 
 }
 
+
+
+// NOTE (yiakwy) : add "bin > threshold_bin" short path, to avoid re-computing
+__device__ __forceinline__ void local_calc_block_offset_hist(int *s_block_count_ptr/*dest*/, int *s_block_offset_ptr/*dest*/, int* g_scratch/*dest*/, const int& tx, const int& lane_id, const int& split_idx, const int& num_splits, const int& threshold_bin, const int* s_local_hist, const int& BLOCK_SIZE) {
+  int local_count = 0;
+  for (int bin = tx; bin < RADIX; bin += BLOCK_SIZE) {
+    if (bin > threshold_bin) local_count += s_local_hist[bin];
+  }
+  __syncwarp();
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_count += __shfl_down_sync(0xffffffff, local_count, offset);
+  }
+  __syncthreads();
+  if (lane_id == 0) {
+    atomicAdd(s_block_count_ptr, local_count);
+  }
+  __syncthreads();
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+  cluster.sync();
+  if (tx == 0) {
+    int offset = 0;
+    for (int r = 0; r < split_idx; ++r) {
+      int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
+      offset += *dst_cnt;
+    }
+    *s_block_offset_ptr = offset;
+  }
+  __syncthreads();
+#else
+  if (tx == 0) { g_scratch[blockIdx.x + split_idx * blockDim.x] = *s_block_count_ptr; }
+  cooperative_groups::this_grid().sync();
+  if (tx == 0) {
+    int offset = 0;
+    for (int i = 0; i < split_idx; ++i) { offset += g_scratch[blockIdx.x + i * blockDim.x]; }
+    *s_block_offset_ptr = offset;
+  }
+  __syncthreads();
+#endif
+}
 
 __device__ __forceinline__ void local_calc_block_offset_with_s_input(int *s_block_count_ptr/*dest*/, int *s_block_offset_ptr/*dest*/, int* g_scratch/*dest*/, const int& tx, const int& lane_id, const int& split_idx, const int& num_splits, const int& threshold_bin, const uint8_t* bin_cache, const float* s_input, const int& s_num_input, const int& BLOCK_SIZE) {
   int local_count = 0;
@@ -383,22 +484,19 @@ __device__ __forceinline__ void local_calc_block_offset_with_s_input(int *s_bloc
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
  auto cluster = cooperative_groups::this_cluster();
 
- if (split_idx == 0) {
+ cluster.sync();
+
+ if (tx == 0) {
    int offset = 0;
-   if (tx == 0) {
-     for (int r = 0; r < num_splits; ++r) {
-       int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
-       int c = *dst_cnt;
-
-       int* dst_off = cluster.map_shared_rank(s_block_offset_ptr, r);
-       *dst_off = offset;
-
-       offset += c;
-     }
+   for (int r = 0; r < split_idx; ++r) {
+     int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
+     offset += *dst_cnt;
    }
+   *s_block_offset_ptr = offset;
  }
 
- cluster.sync();
+ __syncthreads();
+
 #else
  // TODO (yiakwy) : fallback
  if (tx == 0) {
@@ -453,6 +551,7 @@ __device__ __forceinline__ void calc_global_remainder(int* s_last_block_write_of
 #endif
 }
 
+template <int TopK>
 __device__ void fast_topk_split_kv_cuda_tl(
     const float* __restrict__ input,
     int* __restrict__ index,
@@ -469,10 +568,16 @@ __device__ void fast_topk_split_kv_cuda_tl(
 
   alignas(128) __shared__ uint8_t bin_cache[MAX_BIN_CACHE];
 
+  // Sub-bin digits for the threshold-bin candidates.
+  alignas(128) __shared__ uint8_t s_sub_bin[2][SMEM_INPUT_SIZE];
+
   extern __shared__ int shared_mem[][SMEM_INPUT_SIZE];
 
   Tval (*s_input)[SMEM_INPUT_SIZE] = (Tval(*)[SMEM_INPUT_SIZE]) &shared_mem[0][0];
   unsigned int (*s_input_idx)[SMEM_INPUT_SIZE] = (unsigned int(*)[SMEM_INPUT_SIZE]) (&shared_mem[0][0] + SMEM_INPUT_SIZE);
+
+  Tval (*s_input_b)[SMEM_INPUT_SIZE] = (Tval(*)[SMEM_INPUT_SIZE]) (&shared_mem[0][0] + 2 * SMEM_INPUT_SIZE);
+  unsigned int (*s_input_idx_b)[SMEM_INPUT_SIZE] = (unsigned int(*)[SMEM_INPUT_SIZE]) (&shared_mem[0][0] + 3 * SMEM_INPUT_SIZE);
 
   // double buffer
   alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
@@ -535,6 +640,7 @@ __device__ void fast_topk_split_kv_cuda_tl(
     s_write_ptr = 0;
 
     s_last_block_write_offset = 0;
+    s_threshold_bin_id = 0;
   }
   __syncthreads();
 
@@ -635,13 +741,13 @@ __device__ void fast_topk_split_kv_cuda_tl(
           const auto sub_bin = convert_to_uint8(val_scale);
 
           const unsigned int pos = ::atomicAdd(&s_num_input[0], 1);
-          // if (pos < SMEM_INPUT_SIZE) {
+          if (pos < SMEM_INPUT_SIZE) {
             s_input[0][pos] = val_scale;
             s_input_idx[0][pos] = idx;
-            bin_cache[pos] = sub_bin;
-          // }
+            s_sub_bin[0][pos] = sub_bin;
 
-          ::atomicAdd(&s_histogram[sub_bin], 1);
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
         }
       } else {
         Tval val = input[idx + row_start];
@@ -659,13 +765,13 @@ __device__ void fast_topk_split_kv_cuda_tl(
           const auto sub_bin = convert_to_uint8(val_scale);
 
           const unsigned int pos = ::atomicAdd(&s_num_input[0], 1);
-          // if (pos < SMEM_INPUT_SIZE) {
+          if (pos < SMEM_INPUT_SIZE) {
             s_input[0][pos] = val_scale;
             s_input_idx[0][pos] = idx;
-            bin_cache[pos] = sub_bin;
-          // }
+            s_sub_bin[0][pos] = sub_bin;
 
-          ::atomicAdd(&s_histogram[sub_bin], 1);
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
         }
       }
     }    
@@ -684,11 +790,20 @@ __device__ void fast_topk_split_kv_cuda_tl(
     // __syncthreads();
 
     int round = 0;
+    int sub_cur = 0;
     index += topk - global_remainder;
 
     do {
       __syncthreads();
+
       const int scan_size = s_num_input[0];
+
+      const int sub_next = sub_cur ^ 1;
+      Tval (*s_in_cur)[SMEM_INPUT_SIZE] = (sub_cur == 0) ? s_input : s_input_b;
+      unsigned int (*s_idx_cur)[SMEM_INPUT_SIZE] = (sub_cur == 0) ? s_input_idx : s_input_idx_b;
+
+      Tval (*s_in_nxt)[SMEM_INPUT_SIZE] = (sub_cur == 0) ? s_input_b : s_input;
+      unsigned int (*s_idx_nxt)[SMEM_INPUT_SIZE] = (sub_cur == 0) ? s_input_idx_b : s_input_idx;
 
       // stage 6 : repeat fine scale radix sort upon narrowed down elements in the threshold bin
       parallel_reduce_histogram(s_histogram, g_scratch, tx, is_split_mode, num_splits, split_idx, BLOCK_SIZE);
@@ -712,19 +827,19 @@ __device__ void fast_topk_split_kv_cuda_tl(
       }
       __syncthreads();
 
-      local_calc_block_offset_with_s_input(&s_block_count, &s_block_offset, g_scratch, tx, lane_id, split_idx, num_splits, next_threshold_bin, bin_cache, s_input[0], s_num_input[0], BLOCK_SIZE);
+      local_calc_block_offset_with_s_input(&s_block_count, &s_block_offset, g_scratch, tx, lane_id, split_idx, num_splits, next_threshold_bin, s_sub_bin[sub_cur], s_in_cur[0], s_num_input[0], BLOCK_SIZE);
       __syncthreads();
 
       if (next_global_remainder == 0) {
         for (unsigned int idx = tx; idx < scan_size && s_write_ptr < global_remainder; idx += BLOCK_SIZE) {
-          int bin = bin_cache[idx];
+          int bin = s_sub_bin[sub_cur][idx];
 
           if (bin > next_threshold_bin) {
             int local_pos = atomicAdd(&s_write_ptr, 1);
             int global_pos = s_block_offset + local_pos;
   
             if (global_pos < global_remainder) {
-              index[global_pos] = s_input_idx[0][idx];
+              index[global_pos] = s_idx_cur[0][idx];
             }
           }
         }
@@ -738,36 +853,37 @@ __device__ void fast_topk_split_kv_cuda_tl(
         __syncthreads();
 
         for (unsigned int idx = tx; idx < scan_size && s_write_ptr < global_remainder; idx += BLOCK_SIZE) {
-          int bin = bin_cache[idx];
+          int bin = s_sub_bin[sub_cur][idx];
 
-          bin_cache[idx] = 0;
+          s_sub_bin[sub_cur][idx] = 0;
 
           if (bin > next_threshold_bin) {
             int local_pos = atomicAdd(&s_write_ptr, 1);
             int global_pos = s_block_offset + local_pos;
 
             if (global_pos < global_remainder) {
-              index[global_pos] = s_input_idx[0][idx];
+              index[global_pos] = s_idx_cur[0][idx];
             }
           } else if (bin == next_threshold_bin) {
-            Tval val = s_input[0][idx];
+            Tval val = s_in_cur[0][idx];
             Tval val_scale = (val - next_threshold_bin) * RADIX;
             const auto sub_bin = convert_to_uint8(val_scale);
 
             const unsigned int pos = ::atomicAdd(&s_num_input[0], 1);
-            // if (pos < SMEM_INPUT_SIZE) {
-              s_input[0][pos] = val_scale;
-              s_input_idx[0][pos] = s_input_idx[0][idx];
-              bin_cache[pos] = sub_bin;
-            // }
+            if (pos < SMEM_INPUT_SIZE) {
+              s_in_nxt[0][pos] = val_scale;
+              s_idx_nxt[0][pos] = s_idx_cur[0][idx];
+              s_sub_bin[sub_next][pos] = sub_bin;
 
-            ::atomicAdd(&s_histogram[sub_bin], 1);
+              ::atomicAdd(&s_histogram[sub_bin], 1);
+            }
           }
         }
       }
 
       index += global_remainder - next_global_remainder;
       global_remainder = next_global_remainder;
+      sub_cur ^= 1;
       __syncthreads();
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
@@ -779,6 +895,10 @@ __device__ void fast_topk_split_kv_cuda_tl(
 #endif  
 
     } while (++round < 4 && global_remainder > num_splits); // end of do-while loop for global radix refinement
+
+    // The last round wrote into the buffer selected by `sub_cur`.
+    Tval (*s_in_fin)[SMEM_INPUT_SIZE] = (sub_cur == 0) ? s_input : s_input_b;
+    unsigned int (*s_idx_fin)[SMEM_INPUT_SIZE] = (sub_cur == 0) ? s_input_idx : s_input_idx_b;
 
     if (tx == 0) {
       s_write_ptr = 0;
@@ -800,14 +920,14 @@ __device__ void fast_topk_split_kv_cuda_tl(
 
 
             if (dst_input_num > 0) {
-              float* dst_input = cluster.map_shared_rank(&s_input[0][0], r);
-              unsigned int* dst_input_idx = cluster.map_shared_rank(&s_input_idx[0][0], r);
+              float* dst_input = cluster.map_shared_rank(&s_in_fin[0][0], r);
+              unsigned int* dst_input_idx = cluster.map_shared_rank(&s_idx_fin[0][0], r);
 
-              for (unsigned int i=0; i < dst_input_num; i++) {
-                s_input[0][i + count] = dst_input[i];
-                s_input_idx[0][i + count] = dst_input_idx[i];
+              for (unsigned int i = 0; i < dst_input_num && count < SMEM_INPUT_SIZE; i++) {
+                s_in_fin[0][count] = dst_input[i];
+                s_idx_fin[0][count] = dst_input_idx[i];
+                count++;
               }
-              count += dst_input_num;
             }
           }
 
@@ -815,17 +935,18 @@ __device__ void fast_topk_split_kv_cuda_tl(
         }
         __syncthreads();
 
-        // if (tx == 0) {
-        //   printf("count=%d; s_input_idx[0]=%d, s_input_idx[1]=%d, s_input[0]=%f, s_input[1]=%f, global_remainder=%d\n\n", s_num_input[0], s_input_idx[0][0], s_input_idx[0][1], s_input[0][0], s_input[0][1], global_remainder);
-        // }
-        // __syncthreads();
+        Tval (*s_val)[SMEM_INPUT_SIZE] = (sub_cur == 0) ? s_input_b : s_input;
+        for (unsigned int p = tx; p < s_num_input[0]; p += BLOCK_SIZE) {
+          s_val[0][p] = static_cast<Tval>(input[s_idx_fin[0][p] + row_start]);
+        }
+        __syncthreads();
 
         if (tx < s_num_input[0]) {
-          Tval val = s_input[0][tx];
+          Tval val = s_val[0][tx];
           Tval cur_val = val;
           int cur_idx = tx;
           for (int i = 0; i < global_remainder; i++) {
-            atomicUpdateMaxIndex(index + i, &s_input[0][0], &cur_val, &cur_idx, 0);
+            atomicUpdateMaxIndex(index + i, &s_val[0][0], &cur_val, &cur_idx, 0);
 
             if (cur_val == -1) { break; }
             if (cur_val != val) {
@@ -836,7 +957,7 @@ __device__ void fast_topk_split_kv_cuda_tl(
         __syncthreads();
 
         if (tx < global_remainder) {
-          index[tx] = static_cast<int>(s_input_idx[0][index[tx]]);
+          index[tx] = static_cast<int>(s_idx_fin[0][index[tx]]);
         }
         __syncthreads();
       } // end of split_idx == 0
@@ -851,8 +972,11 @@ __device__ void fast_topk_split_kv_cuda_tl(
   } // end of global_remainder > 0 case
 }
 
+#include "topk_harnessed.cuh"
+
+template <int TopK>
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
-    void topk_kernel(const FastTopKParams params, int* g_scratch, bool use_split_kv) {
+    void topk_kernel(const FastTopKParams params, int* g_scratch, bool use_split_kv, bool skip_short_len) {
   const auto& [input, row_starts, indices, lengths, input_stride] = params;
 
   const auto bid = static_cast<uint64_t>(blockIdx.x);
@@ -861,12 +985,17 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // topk
   const auto indice = indices + bid * TopK;
   const auto score = input + bid * input_stride;
 
+  // The single-CTA short path already handled this row (ragged dispatch).
+  if (skip_short_len && static_cast<int>(length) <= SMALL_K_MAX_L) {
+    return;
+  }
   if (length <= TopK) {
-    return naive_topk_cuda(score, indice, length);
+    return naive_topk_cuda(score, indice, length, TopK);
   } else {
-    return fast_topk_split_kv_cuda_tl(score, indice, row_start, length, TopK, g_scratch, use_split_kv);
+    return fast_topk_split_kv_cuda_tl<TopK>(score, indice, row_start, length, TopK, g_scratch, use_split_kv);
   }
 }
+
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     void topk_transform_decode_kernel(
@@ -887,7 +1016,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
   } else {
     __shared__ int s_indices[TopK];
 
-    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_split_kv_cuda_tl<TopK>(score, s_indices, row_start, length);
 
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
@@ -943,7 +1072,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
   } else {
     __shared__ int s_indices[TopK];
 
-    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_split_kv_cuda_tl<TopK>(score, s_indices, row_start, length);
 
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
@@ -978,7 +1107,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
   } else {
     __shared__ int s_indices[TopK];
 
-    fast_topk_split_kv_cuda_tl(score, s_indices, row_start, length);
+    fast_topk_split_kv_cuda_tl<TopK>(score, s_indices, row_start, length);
 
     // copy src[s_indices] to dst, we manually unroll here
     static_assert(TopK % kThreadsPerBlock == 0);
@@ -993,6 +1122,8 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
     dst_indices_entry[idx_1] = pos_1 + offset;
   }
 }
+
+#if !defined(USE_TVM_FFI)
 
 auto get_params(
     const at::Tensor& score,
@@ -1013,7 +1144,10 @@ auto get_params(
     const auto& indices = indices_opt.value();
     TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous());
     TORCH_CHECK(indices.size(0) == B);
-    TORCH_CHECK(indices.size(1) == TopK);
+    TORCH_CHECK(
+        indices.size(1) == 512 || indices.size(1) == 1024 || indices.size(1) == 2048,
+        "fast_topk currently supports topk in {512, 1024, 2048}, got ",
+        indices.size(1));
     indices_data_ptr = indices.data_ptr<int32_t>();
   }
 
@@ -1025,6 +1159,7 @@ auto get_params(
       .input_stride = score.stride(0),
   };
 }
+#endif  // !USE_TVM_FFI
 
 template <auto* f, size_t max_dynamic_smem>
 void setup_kernel_smem_once() {
@@ -1041,18 +1176,223 @@ void setup_kernel_smem_once() {
     return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #endif
   }();
-  TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+  if (result != cudaSuccess) {
+#if !defined(USE_TVM_FFI)
+    TORCH_CHECK(false, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+#else
+    throw std::runtime_error(
+        std::string("set_up_kernel_once failed: ") + ::cudaGetErrorString(result));
+#endif
+  }
 }
 
 }  // namespace
 
+#if !defined(USE_TVM_FFI)
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
+#endif  // !USE_TVM_FFI
 
+template <int TopK>
+void launch_topk_kernel(
+    const FastTopKParams& params,
+    dim3 grid,
+    dim3 block,
+    unsigned int split_kv,
+    int* scratch_ptr,
+    cudaStream_t stream,
+    bool skip_short_len = false) {
+  setup_kernel_smem_once<&topk_kernel<TopK>, kSmem>();
+
+  cudaFuncSetAttribute(&topk_kernel<TopK>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  // NOTE (yiakwy) : opt into clusters larger than the portable 8-CTA cap (Hopper max 16) 
+  if (split_kv > 8) {
+    cudaFuncSetAttribute(&topk_kernel<TopK>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  }
+
+#if ENABLE_HOPPER
+  cudaLaunchConfig_t config = {0};
+
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = kSmem;
+  config.stream = stream;
+
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeClusterDimension;
+  attr[0].val.clusterDim = {1, split_kv, 1};
+  config.attrs = attr;
+  config.numAttrs = 1;
+
+  cudaLaunchKernelEx(&config, topk_kernel<TopK>, params, nullptr, split_kv > 1, skip_short_len);
+#else
+  bool use_split_kv = split_kv > 1;
+  void* kernelArgs[] = {(void*)&params, (void*)&scratch_ptr, (void*)&use_split_kv, (void*)&skip_short_len};
+
+  cudaLaunchCooperativeKernel((void*)&topk_kernel<TopK>, grid, block, kernelArgs, kSmem, stream);
+#endif
+}
+
+// Single-CTA launcher for the short-sequence harnessed kernel.
+template <int TopK>
+void launch_topk_kernel_harnessed(
+    const FastTopKParams& params,
+    dim3 grid,
+    dim3 block,
+    unsigned int split_kv,
+    int* scratch_ptr,
+    cudaStream_t stream) {
+  setup_kernel_smem_once<&topk_kernel_harnessed<TopK>, kSmem>();
+
+  cudaFuncSetAttribute(&topk_kernel_harnessed<TopK>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  // Allow clusters larger than the portable 8-CTA cap (Hopper max 16).
+  cudaFuncSetAttribute(&topk_kernel_harnessed<TopK>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+
+#if ENABLE_HOPPER
+  cudaLaunchConfig_t config = {0};
+
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = kSmem;
+  config.stream = stream;
+
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeClusterDimension;
+  attr[0].val.clusterDim = {1, split_kv, 1};
+  config.attrs = attr;
+  config.numAttrs = 1;
+
+  cudaLaunchKernelEx(&config, topk_kernel_harnessed<TopK>, params, nullptr, split_kv > 1);
+#else
+  bool use_split_kv = split_kv > 1;
+  void* kernelArgs[] = {(void*)&params, (void*)&scratch_ptr, (void*)&use_split_kv};
+
+  cudaLaunchCooperativeKernel((void*)&topk_kernel_harnessed<TopK>, grid, block, kernelArgs, kSmem, stream);
+#endif
+}
+
+// 16-CTA has better perforamnce in Small-K long-L workload.
+static inline unsigned int smallk_widen_split_kv(int topk, int B, unsigned int split_kv) {
+#if ENABLE_HOPPER
+  if ((topk == 512 || topk == 1024) && B <= 4) {
+    split_kv = MIN(CEILDIV(SMs, B), 16);
+  }
+#endif
+  return split_kv;
+}
+
+#ifdef USE_TVM_FFI
+
+void tvm_jit_fast_topk_launch(
+    tvm::ffi::TensorView score,
+    tvm::ffi::TensorView indices,
+    tvm::ffi::TensorView lengths,
+    tvm::ffi::TensorView row_starts,
+    int64_t has_row_starts) {
+  const int B = static_cast<int>(score.size(0));
+  const int topk = static_cast<int>(indices.size(1));
+  if (!(topk == 512 || topk == 1024 || topk == 2048)) {
+    throw std::runtime_error("fast_topk supports topk in {512, 1024, 2048}");
+  }
+
+  FastTopKParams params{
+      static_cast<const float*>(score.data_ptr()),
+      has_row_starts ? static_cast<const int32_t*>(row_starts.data_ptr()) : nullptr,
+      static_cast<int32_t*>(indices.data_ptr()),
+      static_cast<int32_t*>(lengths.data_ptr()),
+      static_cast<int64_t>(score.stride(0)),
+  };
+
+  const auto device = score.device();
+  cudaStream_t stream = static_cast<cudaStream_t>(
+      TVMFFIEnvGetStream(device.device_type, device.device_id));
+
+  unsigned int split_kv = 1;
+  if (B < SMs) {
+    split_kv = CEILDIV(SMs, B);
+    split_kv = MIN(split_kv, 8);
+    if (B >= 64) {
+      split_kv = MIN(split_kv, 2);
+    } else if (B >= 32) {
+      split_kv = MIN(split_kv, 4);
+    } else {
+      split_kv = MIN(split_kv, 8);
+    }
+  }
+  split_kv = smallk_widen_split_kv(topk, B, split_kv);
+
+  dim3 grid(B, split_kv, 1);
+  dim3 block(kThreadsPerBlock, 1, 1);
+
+#ifdef SMALL_K_CTA_CTRL
+
+  auto launch_small_k = [&]() {
+    if (topk == 512) {
+      launch_topk_kernel_small_k<512>(params, B, stream);
+    } else if (topk == 1024) {
+      launch_topk_kernel_small_k<1024>(params, B, stream);
+    } else {
+      launch_topk_kernel_small_k<2048>(params, B, stream);
+    }
+  };
+  auto throw_if_error = []() {
+    const auto rc = cudaGetLastError();
+    if (rc != cudaSuccess) {
+      throw std::runtime_error(std::string("topk kernel failed: ") + ::cudaGetErrorString(rc));
+    }
+  };
+  const int64_t L = static_cast<int64_t>(score.size(1));
+  if ((topk == 512 || topk == 1024 || topk == 2048) && L > 0 && L <= SMALL_K_MAX_L) {
+    launch_small_k();
+    throw_if_error();
+    return;
+  }
+  if ((topk == 512 || topk == 1024 || topk == 2048) && has_row_starts != 0) {
+    // Ragged wide tensor: single-CTA for short rows, distributed (skip_short) for the rest.
+    launch_small_k();
+    switch (topk) {
+      case 512:
+        launch_topk_kernel<512>(params, grid, block, split_kv, nullptr, stream, /*skip_short_len=*/true);
+        break;
+      case 1024:
+        launch_topk_kernel<1024>(params, grid, block, split_kv, nullptr, stream, /*skip_short_len=*/true);
+        break;
+      default:
+        launch_topk_kernel<2048>(params, grid, block, split_kv, nullptr, stream, /*skip_short_len=*/true);
+        break;
+    }
+    throw_if_error();
+    return;
+  }
+#endif // SMALL_K_CTA_CTRL
+
+  switch (topk) {
+    case 512:
+      launch_topk_kernel<512>(params, grid, block, split_kv, nullptr, stream);
+      break;
+    case 1024:
+      launch_topk_kernel<1024>(params, grid, block, split_kv, nullptr, stream);
+      break;
+    default:
+      launch_topk_kernel<2048>(params, grid, block, split_kv, nullptr, stream);
+      break;
+  }
+
+  const auto result = cudaGetLastError();
+  if (result != cudaSuccess) {
+    throw std::runtime_error(
+        std::string("topk kernel failed: ") + ::cudaGetErrorString(result));
+  }
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fast_topk, tvm_jit_fast_topk_launch);
+#endif  // USE_TVM_FFI
+
+#if !defined(USE_TVM_FFI)
 void fast_topk_interface(
     const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt) {
   CHECK_CUDA(score);
   const auto B = score.size(0);
-  const auto L = 65536;  // score.size(1);
+  const auto topk = static_cast<int>(indices.size(1));
 
   CHECK_CUDA(indices);
 
@@ -1066,17 +1406,18 @@ void fast_topk_interface(
   // TODO (yiakwy) : use tvm ffi raw C interface to launch kernel, instead of Aten CUDAStream
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  // NOTE(yiakwy) : Split KV workspace
-  constexpr int min_elements_per_block = TopK;
-
 #if ENABLE_HOPPER
-  // NOTE(yiakwy) : in hopper platform only maximum 12 blocks are supported to use NoC
+  // NOTE(yiakwy) : in hopper platform only maximum 8 blocks per cluster are supported to use NoC
   constexpr int max_kv_split = 8;
 #else
-  const int max_kv_split = SMs;  // CEILDIV(L, min_elements_per_block);
+  const int max_kv_split = SMs;
 #endif
 
-  auto& kernel = topk_kernel;
+  // Ablation override (read once per process)
+  static const int split_override = [] {
+    const char* s = std::getenv("FLASH_FLOAT_TOPK_SPLIT");
+    return s == nullptr ? 0 : std::atoi(s);
+  }();
 
   unsigned int split_kv = 1;
   if (B < SMs) {  // we have enough batches of data to run in parallel
@@ -1109,49 +1450,97 @@ void fast_topk_interface(
     }
 #endif
   }
-
-  // printf("Launching topk kernel with B=%d, L=%d, split_kv=%d\n", B, L, split_kv);
+  split_kv = smallk_widen_split_kv(topk, static_cast<int>(B), split_kv);
+  if (split_override > 0) {
+    // Software is limited to 8 CTAs per cluster; Hopper hard limit is 16 CTAs per cluster.
+    split_kv = MIN(split_override, 16);
+  }
 
   dim3 grid(B, split_kv, 1);
   dim3 block(kThreadsPerBlock, 1, 1);
 
+  int* scratch_ptr = nullptr;
+
+#if !ENABLE_HOPPER
   at::Tensor scratch;
-
-  setup_kernel_smem_once<kernel, kSmem>();
-
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
-
-#if ENABLE_HOPPER
-  cudaLaunchConfig_t config = {0};
-
-  config.gridDim = grid;
-  config.blockDim = block;
-  config.dynamicSmemBytes = kSmem;
-  config.stream = stream;
-
-  cudaLaunchAttribute attr[1];
-  attr[0].id = cudaLaunchAttributeClusterDimension;
-  attr[0].val.clusterDim = {1, split_kv, 1};
-  config.attrs = attr;
-  config.numAttrs = 1;
-
-  // printf("Cooperatively launch kernel with DSHMEM, split_kv=%d\n", split_kv);
-
-  cudaLaunchKernelEx(&config, kernel, params, nullptr, split_kv > 1);
-#else
   if (split_kv > 1) {
     scratch = at::zeros({(long)B, (long)split_kv, RADIX}, score.options().dtype(at::kInt));
+    scratch_ptr = (int*)scratch.data_ptr();
   }
-
-  bool use_split_kv = split_kv > 1;
-  int* scratch_ptr = use_split_kv ? (int*)scratch.data_ptr() : nullptr;
-
-  void* kernelArgs[] = {(void*)&params, (void*)&scratch_ptr, (void*)&use_split_kv};
-
-  // printf("Cooperatively launch kernel with L2 cache\n");
-
-  cudaLaunchCooperativeKernel((void*)kernel, grid, block, kernelArgs, kSmem, stream);
+#else
+  (void)scratch_ptr;
 #endif
+
+  const int L = static_cast<int>(score.size(1));
+
+  const bool use_harnessed = (topk == 512 || topk == 1024) && L > 0 && L <= 32768;
+
+  // Single-CTA short-sequence path for small K (top512/1024/2048, L <= 16384):
+  //   - no fixed NoC-reduce
+  //   - no cluster-barrier cost that dominates at short L
+  //
+  // See top_small_k.cuh. Long-L top2048 keeps the distributed cluster path.
+#ifdef SMALL_K_CTA_CTRL
+  auto launch_small_k = [&]() {
+    if (topk == 512) {
+      launch_topk_kernel_small_k<512>(params, static_cast<int>(B), stream);
+    } else if (topk == 1024) {
+      launch_topk_kernel_small_k<1024>(params, static_cast<int>(B), stream);
+    } else {
+      launch_topk_kernel_small_k<2048>(params, static_cast<int>(B), stream);
+    }
+  };
+
+  const bool small_k_topk = (topk == 512 || topk == 1024 || topk == 2048);
+  if (small_k_topk && L > 0 && L <= SMALL_K_MAX_L) {
+    // Contiguous short row (or ragged whose tensor width already fits): one CTA.
+    launch_small_k();
+  } else if (small_k_topk && row_starts_opt.has_value()) {
+    // Ragged wide tensor (window shorter than the tensor width): the single-CTA
+    // path handles rows with length <= SMALL_K_MAX_L; the distributed kernel is
+    // relaunched with skip_short_len so it only handles the long rows.
+    launch_small_k();
+    switch (topk) {
+      case 512:
+        launch_topk_kernel<512>(params, grid, block, split_kv, scratch_ptr, stream, /*skip_short_len=*/true);
+        break;
+      case 1024:
+        launch_topk_kernel<1024>(params, grid, block, split_kv, scratch_ptr, stream, /*skip_short_len=*/true);
+        break;
+      default:
+        launch_topk_kernel<2048>(params, grid, block, split_kv, scratch_ptr, stream, /*skip_short_len=*/true);
+        break;
+    }
+  } else
+#endif  // SMALL_K_CTA_CTRL
+
+  if (use_harnessed) {
+    // Independent split budget for the harnessed path (can exceed the 8-CTA
+    // portable cluster cap, up to the non-portable max), so a single row can
+    // occupy more SMs at short L. `bs`-dependent: CEILDIV(SMs, B).
+    unsigned int split_h = CEILDIV(SMs, B);
+    if (split_h > (unsigned int)TOPK_HARNESSED_MAX_SPLIT) split_h = (unsigned int)TOPK_HARNESSED_MAX_SPLIT;
+    if (split_h < 1u) split_h = 1u;
+    const dim3 grid_h(B, split_h, 1);
+    if (topk == 512) {
+      launch_topk_kernel_harnessed<512>(params, grid_h, block, split_h, scratch_ptr, stream);
+    } else {
+      launch_topk_kernel_harnessed<1024>(params, grid_h, block, split_h, scratch_ptr, stream);
+    }
+  } else
+  switch (topk) {
+    case 512:
+      launch_topk_kernel<512>(params, grid, block, split_kv, scratch_ptr, stream);
+      break;
+    case 1024:
+      launch_topk_kernel<1024>(params, grid, block, split_kv, scratch_ptr, stream);
+      break;
+    case 2048:
+      launch_topk_kernel<2048>(params, grid, block, split_kv, scratch_ptr, stream);
+      break;
+    default:
+      TORCH_CHECK(false, "fast_topk unsupported topk=", topk, " (expected 512, 1024 or 2048)");
+  }
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
@@ -1255,3 +1644,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fast_topk_transform_fused", &fast_topk_transform_interface, "fast_topk_transform");
   m.def("fast_topk_transform_ragged_fused", &fast_topk_transform_ragged_interface, "fast_topk_transform_ragged");
 }
+#endif  // !USE_TVM_FFI
