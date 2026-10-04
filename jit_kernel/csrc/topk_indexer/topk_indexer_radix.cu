@@ -19,6 +19,7 @@
 // TODO (yiakwy) : using sglang headers to support ROCm data types
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -73,6 +74,10 @@ namespace cg = cooperative_groups;
 #define SMs 132
 #endif
 
+#ifndef TOPK_HARNESSED_MAX_SPLIT
+#define TOPK_HARNESSED_MAX_SPLIT 8
+#endif
+
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER  // Hopper or Blackwell
 // NOTE(yiakwy) : Enable dshmem via NoC for faster decoding
 #define ENABLE_SM90_FEATURES 1
@@ -81,7 +86,12 @@ namespace cg = cooperative_groups;
 namespace {
 
 constexpr int TopK = 2048;
-constexpr int kThreadsPerBlock = 512;
+
+#ifndef TOPK_NUM_THREADS
+#define TOPK_NUM_THREADS 512
+#endif
+
+constexpr int kThreadsPerBlock = TOPK_NUM_THREADS;
 constexpr int RADIX = 256;
 constexpr int WARP_SIZE = 32;
 
@@ -220,6 +230,9 @@ __device__ __forceinline__ auto convert_to_monotonic_8bit(float x) -> uint8_t {
   return bin;
 }
 
+// Single-CTA short-sequence small-K specialization (top512/1024, L <= 16384).
+#include "top_small_k.cuh"
+
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
@@ -295,6 +308,40 @@ __device__ __forceinline__ void parallel_reduce_histogram(int* s_histogram /*src
 #endif  // end of stage 2  
 }
 
+// TODO (yiakwy) : valid optimizatioin; applied to Top2048 pathway
+
+// Harnessed variant: remove cluster barrier
+__device__ __forceinline__ void parallel_reduce_histogram_harnessed(int* s_histogram /*src and dest*/, int* g_scratch/*dest*/, const int& tx, const bool& is_split_mode, const int& num_splits, const int& split_idx, const int& BLOCK_SIZE) {
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+  if (is_split_mode && num_splits > 1) {
+    cluster.sync();
+
+    if (split_idx == 0) {
+      for (int bin = tx; bin < RADIX; bin += BLOCK_SIZE) {
+        int total = s_histogram[bin];
+#pragma unroll
+        for (int r = 1; r < num_splits; ++r) {
+          int* other_hist = cluster.map_shared_rank<int>(&s_histogram[0], r);
+          total += other_hist[bin];
+        }
+        s_histogram[bin] = total;
+      }
+    }
+    cluster.sync();
+
+    if (split_idx != 0) {
+      for (int bin = tx; bin < RADIX; bin += BLOCK_SIZE) {
+        int* dist_hist = cluster.map_shared_rank<int>(&s_histogram[0], 0);
+        s_histogram[bin] = dist_hist[bin];
+      }
+    }
+    __syncthreads();
+  }
+#else
+  parallel_reduce_histogram(s_histogram, g_scratch, tx, is_split_mode, num_splits, split_idx, BLOCK_SIZE);
+#endif
+}
 
 __device__ __forceinline__ void local_calc_block_offset(int *s_block_count_ptr/*dest*/, int *s_block_offset_ptr/*dest*/, int* g_scratch/*dest*/, const int& tx, const int& lane_id, const int& split_idx, const int& num_splits, const int& threshold_bin, const uint8_t* bin_cache, const float* input, const int& start_offset, const int& end_offset, const int& row_start, const int& BLOCK_SIZE) {
   int local_count = 0;
@@ -364,6 +411,46 @@ __device__ __forceinline__ void local_calc_block_offset(int *s_block_count_ptr/*
 
 }
 
+
+
+// NOTE (yiakwy) : add "bin > threshold_bin" short path, to avoid re-computing
+__device__ __forceinline__ void local_calc_block_offset_hist(int *s_block_count_ptr/*dest*/, int *s_block_offset_ptr/*dest*/, int* g_scratch/*dest*/, const int& tx, const int& lane_id, const int& split_idx, const int& num_splits, const int& threshold_bin, const int* s_local_hist, const int& BLOCK_SIZE) {
+  int local_count = 0;
+  for (int bin = tx; bin < RADIX; bin += BLOCK_SIZE) {
+    if (bin > threshold_bin) local_count += s_local_hist[bin];
+  }
+  __syncwarp();
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_count += __shfl_down_sync(0xffffffff, local_count, offset);
+  }
+  __syncthreads();
+  if (lane_id == 0) {
+    atomicAdd(s_block_count_ptr, local_count);
+  }
+  __syncthreads();
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+  cluster.sync();
+  if (tx == 0) {
+    int offset = 0;
+    for (int r = 0; r < split_idx; ++r) {
+      int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
+      offset += *dst_cnt;
+    }
+    *s_block_offset_ptr = offset;
+  }
+  __syncthreads();
+#else
+  if (tx == 0) { g_scratch[blockIdx.x + split_idx * blockDim.x] = *s_block_count_ptr; }
+  cooperative_groups::this_grid().sync();
+  if (tx == 0) {
+    int offset = 0;
+    for (int i = 0; i < split_idx; ++i) { offset += g_scratch[blockIdx.x + i * blockDim.x]; }
+    *s_block_offset_ptr = offset;
+  }
+  __syncthreads();
+#endif
+}
 
 __device__ __forceinline__ void local_calc_block_offset_with_s_input(int *s_block_count_ptr/*dest*/, int *s_block_offset_ptr/*dest*/, int* g_scratch/*dest*/, const int& tx, const int& lane_id, const int& split_idx, const int& num_splits, const int& threshold_bin, const uint8_t* bin_cache, const float* s_input, const int& s_num_input, const int& BLOCK_SIZE) {
   int local_count = 0;
@@ -885,9 +972,11 @@ __device__ void fast_topk_split_kv_cuda_tl(
   } // end of global_remainder > 0 case
 }
 
+#include "topk_harnessed.cuh"
+
 template <int TopK>
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
-    void topk_kernel(const FastTopKParams params, int* g_scratch, bool use_split_kv) {
+    void topk_kernel(const FastTopKParams params, int* g_scratch, bool use_split_kv, bool skip_short_len) {
   const auto& [input, row_starts, indices, lengths, input_stride] = params;
 
   const auto bid = static_cast<uint64_t>(blockIdx.x);
@@ -896,12 +985,17 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // topk
   const auto indice = indices + bid * TopK;
   const auto score = input + bid * input_stride;
 
+  // The single-CTA short path already handled this row (ragged dispatch).
+  if (skip_short_len && static_cast<int>(length) <= SMALL_K_MAX_L) {
+    return;
+  }
   if (length <= TopK) {
     return naive_topk_cuda(score, indice, length, TopK);
   } else {
     return fast_topk_split_kv_cuda_tl<TopK>(score, indice, row_start, length, TopK, g_scratch, use_split_kv);
   }
 }
+
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     void topk_transform_decode_kernel(
@@ -1030,6 +1124,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
 }
 
 #if !defined(USE_TVM_FFI)
+
 auto get_params(
     const at::Tensor& score,
     const at::Tensor& lengths,
@@ -1104,10 +1199,15 @@ void launch_topk_kernel(
     dim3 block,
     unsigned int split_kv,
     int* scratch_ptr,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool skip_short_len = false) {
   setup_kernel_smem_once<&topk_kernel<TopK>, kSmem>();
 
   cudaFuncSetAttribute(&topk_kernel<TopK>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  // NOTE (yiakwy) : opt into clusters larger than the portable 8-CTA cap (Hopper max 16) 
+  if (split_kv > 8) {
+    cudaFuncSetAttribute(&topk_kernel<TopK>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  }
 
 #if ENABLE_HOPPER
   cudaLaunchConfig_t config = {0};
@@ -1123,13 +1223,61 @@ void launch_topk_kernel(
   config.attrs = attr;
   config.numAttrs = 1;
 
-  cudaLaunchKernelEx(&config, topk_kernel<TopK>, params, nullptr, split_kv > 1);
+  cudaLaunchKernelEx(&config, topk_kernel<TopK>, params, nullptr, split_kv > 1, skip_short_len);
+#else
+  bool use_split_kv = split_kv > 1;
+  void* kernelArgs[] = {(void*)&params, (void*)&scratch_ptr, (void*)&use_split_kv, (void*)&skip_short_len};
+
+  cudaLaunchCooperativeKernel((void*)&topk_kernel<TopK>, grid, block, kernelArgs, kSmem, stream);
+#endif
+}
+
+// Single-CTA launcher for the short-sequence harnessed kernel.
+template <int TopK>
+void launch_topk_kernel_harnessed(
+    const FastTopKParams& params,
+    dim3 grid,
+    dim3 block,
+    unsigned int split_kv,
+    int* scratch_ptr,
+    cudaStream_t stream) {
+  setup_kernel_smem_once<&topk_kernel_harnessed<TopK>, kSmem>();
+
+  cudaFuncSetAttribute(&topk_kernel_harnessed<TopK>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  // Allow clusters larger than the portable 8-CTA cap (Hopper max 16).
+  cudaFuncSetAttribute(&topk_kernel_harnessed<TopK>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+
+#if ENABLE_HOPPER
+  cudaLaunchConfig_t config = {0};
+
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = kSmem;
+  config.stream = stream;
+
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeClusterDimension;
+  attr[0].val.clusterDim = {1, split_kv, 1};
+  config.attrs = attr;
+  config.numAttrs = 1;
+
+  cudaLaunchKernelEx(&config, topk_kernel_harnessed<TopK>, params, nullptr, split_kv > 1);
 #else
   bool use_split_kv = split_kv > 1;
   void* kernelArgs[] = {(void*)&params, (void*)&scratch_ptr, (void*)&use_split_kv};
 
-  cudaLaunchCooperativeKernel((void*)&topk_kernel<TopK>, grid, block, kernelArgs, kSmem, stream);
+  cudaLaunchCooperativeKernel((void*)&topk_kernel_harnessed<TopK>, grid, block, kernelArgs, kSmem, stream);
 #endif
+}
+
+// 16-CTA has better perforamnce in Small-K long-L workload.
+static inline unsigned int smallk_widen_split_kv(int topk, int B, unsigned int split_kv) {
+#if ENABLE_HOPPER
+  if ((topk == 512 || topk == 1024) && B <= 4) {
+    split_kv = MIN(CEILDIV(SMs, B), 16);
+  }
+#endif
+  return split_kv;
 }
 
 #ifdef USE_TVM_FFI
@@ -1170,9 +1318,52 @@ void tvm_jit_fast_topk_launch(
       split_kv = MIN(split_kv, 8);
     }
   }
+  split_kv = smallk_widen_split_kv(topk, B, split_kv);
 
   dim3 grid(B, split_kv, 1);
   dim3 block(kThreadsPerBlock, 1, 1);
+
+#ifdef SMALL_K_CTA_CTRL
+
+  auto launch_small_k = [&]() {
+    if (topk == 512) {
+      launch_topk_kernel_small_k<512>(params, B, stream);
+    } else if (topk == 1024) {
+      launch_topk_kernel_small_k<1024>(params, B, stream);
+    } else {
+      launch_topk_kernel_small_k<2048>(params, B, stream);
+    }
+  };
+  auto throw_if_error = []() {
+    const auto rc = cudaGetLastError();
+    if (rc != cudaSuccess) {
+      throw std::runtime_error(std::string("topk kernel failed: ") + ::cudaGetErrorString(rc));
+    }
+  };
+  const int64_t L = static_cast<int64_t>(score.size(1));
+  if ((topk == 512 || topk == 1024 || topk == 2048) && L > 0 && L <= SMALL_K_MAX_L) {
+    launch_small_k();
+    throw_if_error();
+    return;
+  }
+  if ((topk == 512 || topk == 1024 || topk == 2048) && has_row_starts != 0) {
+    // Ragged wide tensor: single-CTA for short rows, distributed (skip_short) for the rest.
+    launch_small_k();
+    switch (topk) {
+      case 512:
+        launch_topk_kernel<512>(params, grid, block, split_kv, nullptr, stream, /*skip_short_len=*/true);
+        break;
+      case 1024:
+        launch_topk_kernel<1024>(params, grid, block, split_kv, nullptr, stream, /*skip_short_len=*/true);
+        break;
+      default:
+        launch_topk_kernel<2048>(params, grid, block, split_kv, nullptr, stream, /*skip_short_len=*/true);
+        break;
+    }
+    throw_if_error();
+    return;
+  }
+#endif // SMALL_K_CTA_CTRL
 
   switch (topk) {
     case 512:
@@ -1222,6 +1413,12 @@ void fast_topk_interface(
   const int max_kv_split = SMs;
 #endif
 
+  // Ablation override (read once per process)
+  static const int split_override = [] {
+    const char* s = std::getenv("FLASH_FLOAT_TOPK_SPLIT");
+    return s == nullptr ? 0 : std::atoi(s);
+  }();
+
   unsigned int split_kv = 1;
   if (B < SMs) {  // we have enough batches of data to run in parallel
     split_kv = CEILDIV(SMs, B);
@@ -1253,11 +1450,17 @@ void fast_topk_interface(
     }
 #endif
   }
+  split_kv = smallk_widen_split_kv(topk, static_cast<int>(B), split_kv);
+  if (split_override > 0) {
+    // Software is limited to 8 CTAs per cluster; Hopper hard limit is 16 CTAs per cluster.
+    split_kv = MIN(split_override, 16);
+  }
 
   dim3 grid(B, split_kv, 1);
   dim3 block(kThreadsPerBlock, 1, 1);
 
   int* scratch_ptr = nullptr;
+
 #if !ENABLE_HOPPER
   at::Tensor scratch;
   if (split_kv > 1) {
@@ -1268,6 +1471,63 @@ void fast_topk_interface(
   (void)scratch_ptr;
 #endif
 
+  const int L = static_cast<int>(score.size(1));
+
+  const bool use_harnessed = (topk == 512 || topk == 1024) && L > 0 && L <= 32768;
+
+  // Single-CTA short-sequence path for small K (top512/1024/2048, L <= 16384):
+  //   - no fixed NoC-reduce
+  //   - no cluster-barrier cost that dominates at short L
+  //
+  // See top_small_k.cuh. Long-L top2048 keeps the distributed cluster path.
+#ifdef SMALL_K_CTA_CTRL
+  auto launch_small_k = [&]() {
+    if (topk == 512) {
+      launch_topk_kernel_small_k<512>(params, static_cast<int>(B), stream);
+    } else if (topk == 1024) {
+      launch_topk_kernel_small_k<1024>(params, static_cast<int>(B), stream);
+    } else {
+      launch_topk_kernel_small_k<2048>(params, static_cast<int>(B), stream);
+    }
+  };
+
+  const bool small_k_topk = (topk == 512 || topk == 1024 || topk == 2048);
+  if (small_k_topk && L > 0 && L <= SMALL_K_MAX_L) {
+    // Contiguous short row (or ragged whose tensor width already fits): one CTA.
+    launch_small_k();
+  } else if (small_k_topk && row_starts_opt.has_value()) {
+    // Ragged wide tensor (window shorter than the tensor width): the single-CTA
+    // path handles rows with length <= SMALL_K_MAX_L; the distributed kernel is
+    // relaunched with skip_short_len so it only handles the long rows.
+    launch_small_k();
+    switch (topk) {
+      case 512:
+        launch_topk_kernel<512>(params, grid, block, split_kv, scratch_ptr, stream, /*skip_short_len=*/true);
+        break;
+      case 1024:
+        launch_topk_kernel<1024>(params, grid, block, split_kv, scratch_ptr, stream, /*skip_short_len=*/true);
+        break;
+      default:
+        launch_topk_kernel<2048>(params, grid, block, split_kv, scratch_ptr, stream, /*skip_short_len=*/true);
+        break;
+    }
+  } else
+#endif  // SMALL_K_CTA_CTRL
+
+  if (use_harnessed) {
+    // Independent split budget for the harnessed path (can exceed the 8-CTA
+    // portable cluster cap, up to the non-portable max), so a single row can
+    // occupy more SMs at short L. `bs`-dependent: CEILDIV(SMs, B).
+    unsigned int split_h = CEILDIV(SMs, B);
+    if (split_h > (unsigned int)TOPK_HARNESSED_MAX_SPLIT) split_h = (unsigned int)TOPK_HARNESSED_MAX_SPLIT;
+    if (split_h < 1u) split_h = 1u;
+    const dim3 grid_h(B, split_h, 1);
+    if (topk == 512) {
+      launch_topk_kernel_harnessed<512>(params, grid_h, block, split_h, scratch_ptr, stream);
+    } else {
+      launch_topk_kernel_harnessed<1024>(params, grid_h, block, split_h, scratch_ptr, stream);
+    }
+  } else
   switch (topk) {
     case 512:
       launch_topk_kernel<512>(params, grid, block, split_kv, scratch_ptr, stream);

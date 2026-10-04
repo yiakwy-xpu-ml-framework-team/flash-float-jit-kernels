@@ -23,7 +23,29 @@ _cand = os.environ.get("FLASH_FLOAT_TOPK_MAX_CANDIDATES")
 if _cand:
     _CAND_FLAGS = [f"-DTOPK_MAX_CANDIDATES={int(_cand)}"]
 
-common_cuda_flags = ["-O2", _COMPAT_FLAG] + _CAND_FLAGS
+_SPLIT_FLAGS = []
+_split = os.environ.get("FLASH_FLOAT_TOPK_HARNESSED_SPLIT")
+if _split:
+    _SPLIT_FLAGS = [f"-DTOPK_HARNESSED_MAX_SPLIT={int(_split)}"]
+
+# SMALL_K_CTA_CTRL: single-CTA short-sequence (L <= 16384) small-K path
+_SMALL_K_FLAGS = []
+if os.environ.get("FLASH_FLOAT_TOPK_SMALL_K_CTA", "1") != "0":
+    _SMALL_K_FLAGS = ["-DSMALL_K_CTA_CTRL"]
+
+# Thread-count override (default kThreadsPerBlock=512).
+_THREADS_FLAGS = []
+_threads = os.environ.get("FLASH_FLOAT_TOPK_THREADS")
+if _threads:
+    _THREADS_FLAGS = [f"-DTOPK_NUM_THREADS={int(_threads)}"]
+
+common_cuda_flags = (
+    ["-O2", _COMPAT_FLAG]
+    + _CAND_FLAGS
+    + _SPLIT_FLAGS
+    + _SMALL_K_FLAGS
+    + _THREADS_FLAGS
+)
 
 
 def _arch_flags():
@@ -35,7 +57,17 @@ def _arch_flags():
 
 
 def _tvm_ffi_flags():
-    flags = ["-O2", _COMPAT_FLAG, "-std=c++17"] + _CAND_FLAGS
+    # tvm_ffi copies the source into a temp build dir, so the relative
+    # `#include "top_small_k.cuh"` / `"topk_harnessed.cuh"` need the kernel
+    # directory on the include path.
+    flags = (
+        ["-O2", _COMPAT_FLAG, "-std=c++17"]
+        + _CAND_FLAGS
+        + _SPLIT_FLAGS
+        + _SMALL_K_FLAGS
+        + _THREADS_FLAGS
+        + [f"-I{KERNEL_PATH / 'csrc' / 'topk_indexer'}"]
+    )
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9:
         flags += ["-DENABLE_HOPPER=1"]
     return flags
